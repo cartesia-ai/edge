@@ -1,0 +1,156 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import io
+import os
+
+# Note: To use the 'upload' functionality of this file, you must:
+#   $ pipenv install twine --dev
+import subprocess
+import sys
+from distutils.util import convert_path
+from shutil import rmtree
+
+from setuptools import Command, find_packages, setup
+
+PACKAGE_DIR = "cartesia_metal"
+main_ns = {}
+ver_path = convert_path(os.path.join(PACKAGE_DIR, "version.py"))
+with open(ver_path) as ver_file:
+    exec(ver_file.read(), main_ns)
+
+# Package meta-data.
+NAME = "cartesia-metal"
+DESCRIPTION = "The official Cartesia metal bindings."
+URL = ""
+EMAIL = "support@cartesia.ai"
+AUTHOR = "Cartesia, Inc."
+REQUIRES_PYTHON = ">=3.9.0"
+VERSION = main_ns["__version__"]
+
+
+# What packages are required for this module to be executed?
+def get_requirements(path):
+    with open(path, "r") as f:
+        out = f.read().splitlines()
+
+    out = [line.strip() for line in out]
+    return out
+
+
+REQUIRED = get_requirements("requirements.txt")
+EXTRAS = {}
+
+# Ensure Xcode and mlx is installed
+here = os.path.abspath(os.path.dirname(__file__))
+subprocess.check_call(
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-r",
+        os.path.join(here, "requirements.txt"),
+    ]
+)
+
+
+# Import the README and use it as the long-description.
+# Note: this will only work if 'README.md' is present in your MANIFEST.in file!
+try:
+    with io.open(os.path.join(here, "README.md"), encoding="utf-8") as f:
+        long_description = "\n" + f.read()
+except FileNotFoundError:
+    long_description = DESCRIPTION
+
+# Load the package's __version__.py module as a dictionary.
+about = {}
+if not VERSION:
+    project_slug = NAME.lower().replace("-", "_").replace(" ", "_")
+    with open(os.path.join(here, project_slug, "__version__.py")) as f:
+        exec(f.read(), about)
+else:
+    about["__version__"] = VERSION
+
+
+class UploadCommand(Command):
+    """Support setup.py upload."""
+
+    description = "Build and publish the package."
+    user_options = [("skip-upload", "u", "skip git tagging and pypi upload")]
+    boolean_options = ["skip-upload"]
+
+    @staticmethod
+    def status(s):
+        """Prints things in bold."""
+        print("\033[1m{0}\033[0m".format(s))
+
+    def initialize_options(self):
+        self.skip_upload = False
+
+    def finalize_options(self):
+        self.skip_upload = bool(self.skip_upload)
+
+    def run(self):
+        try:
+            self.status("Removing previous builds…")
+            rmtree(os.path.join(here, "dist"))
+            rmtree(os.path.join(here, "build"))
+        except OSError:
+            pass
+
+        self.status("Building Source and Wheel (universal) distribution…")
+        os.system("{0} setup.py sdist bdist_wheel --universal".format(sys.executable))
+
+        if self.skip_upload:
+            self.status("Skipping git tagging and pypi upload")
+            sys.exit()
+
+        self.status("Uploading the package to PyPI via Twine…")
+        os.system("twine upload dist/*")
+
+        self.status("Pushing git tags…")
+        os.system("git tag v{0}".format(about["__version__"]))
+        os.system("git push --tags")
+
+        sys.exit()
+
+
+from mlx import extension
+
+if __name__ == "__main__":
+    setup(
+        name=NAME,
+        version=about["__version__"],
+        description=DESCRIPTION,
+        long_description=long_description,
+        long_description_content_type="text/markdown",
+        author=AUTHOR,
+        author_email=EMAIL,
+        python_requires=REQUIRES_PYTHON,
+        url=URL,
+        packages=find_packages(
+            exclude=[
+                "scratch",
+                "tests",
+                "*.tests",
+                "*.tests.*",
+                "tests.*",
+            ]
+        ),
+        install_requires=REQUIRED,
+        extras_require=EXTRAS,
+        include_package_data=True,
+        classifiers=[
+            # Trove classifiers
+            # Full list: https://pypi.python.org/pypi?%3Aaction=list_classifiers
+            "Programming Language :: Python",
+            "Programming Language :: Python :: 3",
+            "Topic :: Scientific/Engineering :: Artificial Intelligence",
+        ],
+        # $ setup.py publish support.
+        cmdclass={"upload": UploadCommand, "build_ext": extension.CMakeBuild},
+        ext_modules=[extension.CMakeExtension("cartesia_metal._ext")],
+        package_data={"cartesia_metal": ["*.so", "*.dylib", "*.metallib"]},
+        zip_safe=False,
+    )

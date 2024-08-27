@@ -1,0 +1,2 @@
+mlx==0.16.1  # TODO: upgrade to latest mlx version once nanobind for mlx-extensions is upgraded: https://github.com/ml-explore/mlx/issues/1342
+cmake>=3.24

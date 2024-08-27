@@ -1,0 +1,9 @@
+mlx==0.16.1
+transformers>=4.40.0
+setuptools>=42
+datasets
+torch
+numpy<2 # some packages require numpy<2
+requests
+# cartesia-metal
+huggingface_hub

@@ -1,0 +1,5 @@
+pytype==2024.4.11
+isort==5.13.2
+ruff==0.4.10
+pytest
+pytest-cov

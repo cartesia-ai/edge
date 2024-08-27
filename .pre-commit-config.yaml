@@ -1,0 +1,15 @@
+# NOTE: These versions should match those in requirements-dev.txt
+repos:
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  # Ruff version.
+  rev: v0.4.10
+  hooks:
+    # Run the linter.
+    - id: ruff
+      args: [ --fix ]
+    # Run the formatter.
+    - id: ruff-format
+- repo: https://github.com/timothycrosley/isort
+  rev: 5.13.2
+  hooks:
+  -   id: isort

@@ -1,0 +1,47 @@
+name: Cartesia Python CI
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      # all python files
+      - '**/*.py'
+      # This file
+      - '**/lint.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '**/*.py'
+      # This file
+      - '**/lint.yml'
+    
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+
+  Linting:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10"]
+        
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/cache@v2
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip
+
+      - name: Install Dependencies
+        run: |
+          make install-dev
+
+      - name: Lint with ruff
+        run: |
+          make lint
