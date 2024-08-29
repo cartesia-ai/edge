@@ -3,16 +3,9 @@
 This package contains implementations for fast on-device SSM inference on Apple silicon. 
 
 ## Installation
-To install this package, first install Xcode, which can be downloaded from https://developer.apple.com/xcode/.
-Accept the license agreement with:
-```shell 
-sudo xcodebuild -license
-```
-
-Install the required dependencies: the exact version of `nanobind`, followed by `cartesia-metal`, and finally `cartesia-mlx`, with the following commands:
-```shell 
-pip install nanobind@git+https://github.com/wjakob/nanobind.git@2f04eac452a6d9142dedb957701bdb20125561e4
-pip install git+https://github.com/cartesia-ai/edge.git#subdirectory=cartesia-metal
+To install this package, first follow the [installation instructions for `cartesia-metal`](../cartesia-metal/README.md#Installation).
+Next (in your Python environment) install the `cartesia-mlx` package:
+```shell
 pip install cartesia-mlx
 ```
 

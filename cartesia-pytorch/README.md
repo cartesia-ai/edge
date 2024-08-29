@@ -19,6 +19,9 @@ Rene was pretrained on 1.5 trillion tokens of the [Dolma-1.7](https://huggingfac
 For more details, see our [blog post](https://cartesia.ai/blog/on-device).
 
 ## Usage
+This is the PyTorch version of the package, and it's intended to run on CUDA devices.
+For use on Mac computers, please install [the native MLX version](../cartesia-mlx) instead.
+
 ### Installation
 The Rene model depends on the `cartesia-pytorch` package, which can be installed with `pip` as follows:
 ```shell
