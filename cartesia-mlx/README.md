@@ -7,6 +7,7 @@ To install this package, first follow the [installation instructions for `cartes
 Next (in your Python environment) install the `cartesia-mlx` package:
 ```shell
 pip install cartesia-mlx
+pip install -r requirements.txt
 ```
 
 Note: This package has been tested on macOS Sonoma 14.1 with the M3 chip.
