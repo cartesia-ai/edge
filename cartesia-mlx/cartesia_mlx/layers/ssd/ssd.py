@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from cartesia_metal import conv1d_forward, conv1d_update, ssd_update, ssd_update_no_z
+from cartesia_metal import conv1d_forward, conv1d_update, ssd_update
 from cartesia_mlx.layers.ssd.ops import ssd_forward_attn
 from cartesia_mlx.utils.configure import Inherit, set_cfg
 
@@ -102,8 +102,8 @@ class SSD(nn.Module):
         )
 
         xBC, conv_state = conv1d_forward(
-            xBC, self.conv_weight, self.conv_bias, conv_state
-        )  # Fused silu
+            xBC, self.conv_weight, self.conv_bias, conv_state, swish=True
+        )
 
         x, B, C = mx.split(
             xBC, [self.d_inner, self.d_inner + self.d_state * self.n_groups], axis=-1
@@ -133,7 +133,6 @@ class SSD(nn.Module):
             x = self.rms_norm(x)
 
         x = self.out_proj(x)
-
         return x, (conv_state, ssm_state)
 
     def step(
@@ -161,8 +160,12 @@ class SSD(nn.Module):
         )
 
         xBC, conv_state = conv1d_update(
-            xBC, self.conv_weight, self.conv_bias, conv_state
-        )  # Fused silu
+            xBC,
+            self.conv_weight,
+            self.conv_bias,
+            conv_state,
+            swish=True,
+        )
 
         x, B, C = mx.split(
             xBC, [self.d_inner, self.d_inner + self.d_state * self.n_groups], axis=-1
@@ -172,36 +175,23 @@ class SSD(nn.Module):
         C = C.reshape(b, self.n_groups, -1)  # (b, g, n)
         x = x.reshape(b, self.n_heads, self.d_head)  # (b, h, d_head)
 
+        x, ssm_state = ssd_update(
+            x,
+            dt,
+            self.A,
+            B,
+            C,
+            self.D,
+            self.dt_bias,
+            dt_min=self.dt_limit[0],
+            dt_max=self.dt_limit[1],
+            state=ssm_state,
+            z=None if self.norm_before_gate is True else z,
+        )
+        x = self.rms_norm(x)
+
         if self.norm_before_gate is True:
-            x, ssm_state = ssd_update_no_z(
-                x,
-                dt,
-                self.A,
-                B,
-                C,
-                self.D,
-                self.dt_bias,
-                dt_min=self.dt_limit[0],
-                dt_max=self.dt_limit[1],
-                state=ssm_state,
-            )
-            x = self.rms_norm(x)
             x = x * nn.silu(z)
-        else:
-            x, ssm_state = ssd_update(
-                x,
-                dt,
-                self.A,
-                B,
-                C,
-                self.D,
-                z,
-                self.dt_bias,
-                dt_min=self.dt_limit[0],
-                dt_max=self.dt_limit[1],
-                state=ssm_state,
-            )
-            x = self.rms_norm(x)
 
         x = self.out_proj(x)
 

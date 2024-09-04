@@ -15,6 +15,7 @@ def ssd_forward_attn(
     dt_bias: mx.array,
     dt_min: float,
     dt_max: float,
+    softplus: bool = True,
 ) -> Tuple[mx.array, mx.array]:
     """SSD-SSM forward pass.
 
@@ -28,19 +29,15 @@ def ssd_forward_attn(
         dt_bias: Bias for time deltas of shape (num_heads,).
         dt_min: Minimum value for time deltas after clipping.
         dt_max: Maximum value for time deltas after clipping.
-        state: Previous state for recurrent connections.
-            Shape (batch_size, n_heads, d_head, d_state).
-
-    Returns:
-        Output and next state.
     """
     b, l, h, dh = x.shape
     _, _, g, _ = B.shape
 
-    if dt_bias is not None:
-        dt = dt + dt_bias.reshape(1, 1, -1)
+    dt = dt + dt_bias.reshape(1, 1, -1)
 
-    dt = nn.softplus(dt)
+    if softplus is True:
+        dt = nn.softplus(dt)
+
     dt = mx.clip(dt, a_min=dt_min, a_max=dt_max).astype(x.dtype)
 
     B = mx.swapaxes(mx.swapaxes(B, 1, 3), 1, 2)
@@ -66,9 +63,7 @@ def ssd_forward_attn(
     dtxdecay = dtxdecay.swapaxes(1, 2).swapaxes(2, 3)
     next_state = dtxdecay @ B
 
-    if D is not None:
-        y += x * D.reshape(1, 1, h, 1)
-
+    y += x * D.reshape(1, 1, h, 1)
     y = y.reshape(b, l, h * dh)
 
     return y, next_state

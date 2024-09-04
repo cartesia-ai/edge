@@ -8,6 +8,8 @@
 
 #include "src/conv1d_update.h"
 #include "src/conv1d_forward.h"
+#include "src/conv1d_swish_update.h"
+#include "src/conv1d_swish_forward.h"
 #include "src/ssm_update.h"
 #include "src/ssd_update.h"
 #include "src/ssd_update_no_z.h"
@@ -20,7 +22,7 @@ using namespace mlx::core;
 NB_MODULE(_ext, m) {
 
   m.def(
-      "conv1d_update",
+      "conv1d_update_",
       [](const array& x, const array& w, const array& b, const array& state, StreamOrDevice s) {
         return conv1d_update(x, w, b, state, s);
       },
@@ -36,6 +38,31 @@ NB_MODULE(_ext, m) {
       "conv1d_forward_",
       [](const array& x, const array& w, const array& b, StreamOrDevice s) {
         return conv1d_forward(x, w, b, s);
+      },
+      nb::arg(),
+      nb::arg(),
+      nb::arg(),
+      nb::kw_only(),
+      "stream"_a = nb::none()
+  );
+
+  m.def(
+      "conv1d_swish_update_",
+      [](const array& x, const array& w, const array& b, const array& state, StreamOrDevice s) {
+        return conv1d_swish_update(x, w, b, state, s);
+      },
+      nb::arg(),
+      nb::arg(),
+      nb::arg(),
+      nb::arg(),
+      nb::kw_only(),
+      "stream"_a = nb::none()
+  );
+
+  m.def(
+      "conv1d_swish_forward_",
+      [](const array& x, const array& w, const array& b, StreamOrDevice s) {
+        return conv1d_swish_forward(x, w, b, s);
       },
       nb::arg(),
       nb::arg(),

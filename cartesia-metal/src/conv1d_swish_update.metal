@@ -4,8 +4,16 @@
 #include "mlx/backend/metal/kernels/bf16.h"
 #include "mlx/backend/metal/kernels/utils.h"
 
+struct SILU {
+  template <typename T>
+  T operator()(T x) {
+    auto y = 1 / (1 + metal::exp(-metal::abs(x)));
+    return (x < 0) ? (1 - y) * x : y * x;
+  }
+};
+
 template <typename T>
-[[kernel]] void conv1d_update_kernel(
+[[kernel]] void conv1d_swish_update_kernel(
     device const T* x [[buffer(0)]], // b, d
     device const T* w [[buffer(1)]], // d, k
     device const T* b [[buffer(2)]], // d
@@ -32,6 +40,7 @@ template <typename T>
 
     temp = temp + w[w_start_idx + kernel_size - 1] * x[x_idx];
     temp = temp + b[channel_idx];
+    temp = SILU()(temp);
     y[x_idx] = temp;
 
     #pragma unroll
@@ -42,9 +51,9 @@ template <typename T>
 } 
 
 
-#define instantiate_conv1d_update_kernel(type_name, type)       \
-  template [[host_name("conv1d_update_kernel_" #type_name)]]    \
-  [[kernel]] void conv1d_update_kernel<type>(                   \
+#define instantiate_conv1d_swish_update_kernel(type_name, type)       \
+  template [[host_name("conv1d_swish_update_kernel_" #type_name)]]    \
+  [[kernel]] void conv1d_swish_update_kernel<type>(                   \
     device const type* x [[buffer(0)]],                         \
     device const type* w [[buffer(1)]],                         \
     device const type* b [[buffer(2)]],                         \
@@ -57,7 +66,7 @@ template <typename T>
     uint3 grid_idx [[thread_position_in_grid]],                 \
     uint3 grid_size [[threads_per_grid]]); 
 
-instantiate_conv1d_update_kernel(float32, float);
-instantiate_conv1d_update_kernel(float16, half);
-//instantiate_conv1d_update_kernel(bfloat16, bfloat16_t);
-//instantiate_conv1d_update_kernel(complex64, complex64_t);
+instantiate_conv1d_swish_update_kernel(float32, float);
+instantiate_conv1d_swish_update_kernel(float16, half);
+//instantiate_conv1d_swish_update_kernel(bfloat16, bfloat16_t);
+//instantiate_conv1d_swish_update_kernel(complex64, complex64_t);

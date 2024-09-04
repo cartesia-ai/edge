@@ -48,29 +48,17 @@ class ResidualBlock(nn.Module):
         """
         r = x
         if self.norm_point == "pre":
-            if len(x.shape) == 3 and x.shape[1] == 1:
-                b, l, d = x.shape
-                x = self.norm(x.reshape(b, d)).reshape(b, l, d)
-            else:
-                x = self.norm(x)
+            x = self.norm(x)
         z = self.layer(x, *args, state=state, **kwargs)
         if self.stateful:
             x, state = z
         else:
             x, state = z, None
         if self.norm_point == "pre_resid":
-            if len(x.shape) == 3 and x.shape[1] == 1:
-                b, l, d = x.shape
-                x = self.norm(x.reshape(b, d)).reshape(b, l, d)
-            else:
-                x = self.norm(x)
+            x = self.norm(x)
         x = x + r
         if self.norm_point == "post":
-            if len(x.shape) == 3 and x.shape[1] == 1:
-                b, l, d = x.shape
-                x = self.norm(x.reshape(b, d)).reshape(b, l, d)
-            else:
-                x = self.norm(x)
+            x = self.norm(x)
         if self.stateful:
             return x, state
         return x

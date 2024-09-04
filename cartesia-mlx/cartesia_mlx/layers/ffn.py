@@ -1,42 +1,49 @@
+import math
 from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from cartesia_mlx.utils.configure import Inherit, set_cfg
+from cartesia_mlx.utils.registry import ACTIVATIONS, NORMS
 
 
 class FFN(nn.Module):
-    """A base class for feed-forward networks."""
+    """Standard feed-forward network."""
 
     base_cfg = dict(
         _class_="layers.ffn.FFN",
         quantization_kwargs=Inherit(default=None),
+        quantize_gate=True,
         d_model=Inherit(default=1024),
         expand=4,
         activation="swish",  # or 'gelu'
+        norm=None,
         glu=False,
         bias=False,
-        norm=False,
+        bugged=False,  # skilled cherry is trained on a bugged model where both the gate and input are activated.
     )
 
     def __init__(self, cfg=None, parent=None):
         super().__init__()
         set_cfg(self, cfg, parent)
-        self.d_inner = int(round(self.expand * self.d_model))
         Linear = (
             partial(nn.QuantizedLinear, **self.quantization_kwargs)
             if self.quantization_kwargs
             else nn.Linear
         )
+        self.d_inner = int(round(self.expand * self.d_model))
         self.in_proj = Linear(self.d_model, self.d_inner, bias=self.bias)
         self.out_proj = Linear(self.d_inner, self.d_model, bias=self.bias)
         if self.glu:
-            self.gate_proj = nn.Linear(self.d_model, self.d_inner, bias=self.bias)
+            if self.quantization_kwargs and self.quantize_gate:
+                Linear = partial(nn.QuantizedLinear, **self.quantization_kwargs)
+            else:
+                Linear = nn.Linear
+            self.gate_proj = Linear(self.d_model, self.d_inner, bias=self.bias)
         if self.norm:
-            self.norm = nn.RMSNorm(self.d_inner)
-        assert self.activation in ["swish", "gelu"]
-        self.activation = nn.silu if self.activation == "swish" else nn.gelu
+            self.norm = NORMS[self.norm](self.d_inner)
+        self.activation = ACTIVATIONS[self.activation]
 
     def __call__(self, x: mx.array, *args, **kwargs) -> mx.array:
         """Forward pass.

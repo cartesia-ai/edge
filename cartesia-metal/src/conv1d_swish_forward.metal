@@ -4,8 +4,16 @@
 #include "mlx/backend/metal/kernels/bf16.h"
 #include "mlx/backend/metal/kernels/utils.h"
 
+struct SILU {
+  template <typename T>
+  T operator()(T x) {
+    auto y = 1 / (1 + metal::exp(-metal::abs(x)));
+    return (x < 0) ? (1 - y) * x : y * x;
+  }
+};
+
 template <typename T>
-[[kernel]] void conv1d_forward_kernel(
+[[kernel]] void conv1d_swish_forward_kernel(
     device const T* x [[buffer(0)]],      // (b, d, l)
     device const T* w [[buffer(1)]],      // (d, k)
     device const T* b [[buffer(2)]],      // (d)
@@ -31,14 +39,16 @@ template <typename T>
           acc = acc + w[w_start_idx + i] * x[y_idx + i];
       }
       acc = acc + b[channel_idx];
+      acc = SILU()(acc);
     }
+
      y[y_idx] = acc; 
 } 
 
 
-#define instantiate_conv1d_forward_kernel(type_name, type)       \
-  template [[host_name("conv1d_forward_kernel_" #type_name)]]    \
-  [[kernel]] void conv1d_forward_kernel<type>(                   \
+#define instantiate_conv1d_swish_forward_kernel(type_name, type)       \
+  template [[host_name("conv1d_swish_forward_kernel_" #type_name)]]    \
+  [[kernel]] void conv1d_swish_forward_kernel<type>(                   \
     device const type* x [[buffer(0)]],                         \
     device const type* w [[buffer(1)]],                         \
     device const type* b [[buffer(2)]],                         \
@@ -48,7 +58,7 @@ template <typename T>
     uint3 grid_idx [[thread_position_in_grid]],                 \
     uint3 grid_size [[threads_per_grid]]); 
 
-instantiate_conv1d_forward_kernel(float32, float);
-instantiate_conv1d_forward_kernel(float16, half);
-//instantiate_conv1d_forward_kernel(bfloat16, bfloat16_t);
-//instantiate_conv1d_forward_kernel(complex64, complex64_t);
+instantiate_conv1d_swish_forward_kernel(float32, float);
+instantiate_conv1d_swish_forward_kernel(float16, half);
+//instantiate_conv1d_swish_forward_kernel(bfloat16, bfloat16_t);
+//instantiate_conv1d_swish_forward_kernel(complex64, complex64_t);
