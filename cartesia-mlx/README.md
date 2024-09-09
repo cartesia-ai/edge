@@ -32,7 +32,7 @@ python example.py --model cartesia-ai/Mohawk-v0.1-1.3B-4bit-mlx --prompt "Rene D
 ```
 
 ## Performance
-<img src="assets/quality-throughput.png" alt="Quality/Throughput comparison (1-2B)" style="width:50%;"/>
+<img src="assets/quality-throughput.png" alt="Quality/Throughput comparison (1-2B)" style="width:70%;"/>
 
 ![LlaMamba scaling](assets/llamamba-scaling.png)
 
