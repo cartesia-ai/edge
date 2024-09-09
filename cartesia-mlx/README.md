@@ -32,7 +32,7 @@ python example.py --model cartesia-ai/Mohawk-v0.1-1.3B-4bit-mlx --prompt "Rene D
 ```
 
 ## Performance
-![Quality/Throughput comparison (1-2B)](assets/quality-throughput.png)
+<img src="assets/quality-throughput.png" alt="Quality/Throughput comparison (1-2B)" style="width:50%;"/>
 ![LlaMamba scaling](assets/llamamba-scaling.png)
 
 You can pass any of the models listed above to the `--model` argument; for a full list of command-line options, pass `--help`.
