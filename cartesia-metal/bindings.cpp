@@ -15,109 +15,35 @@
 #include "src/ssd_update_no_z.h"
 
 namespace nb = nanobind;
-using namespace nb::literals;
 
 using namespace mlx::core;
 
 NB_MODULE(_ext, m) {
+    m.def("conv1d_update_", &conv1d_update, 
+          nb::arg("x"), nb::arg("w"), nb::arg("b"), nb::arg("state"), 
+          nb::kw_only(), nb::arg("stream") = nb::none());
 
-  m.def(
-      "conv1d_update_",
-      [](const array& x, const array& w, const array& b, const array& state, StreamOrDevice s) {
-        return conv1d_update(x, w, b, state, s);
-      },
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::kw_only(),
-      "stream"_a = nb::none()
-  );
+    m.def("conv1d_forward_", &conv1d_forward, 
+          nb::arg("x"), nb::arg("w"), nb::arg("b"), 
+          nb::kw_only(), nb::arg("stream") = nb::none());
 
-  m.def(
-      "conv1d_forward_",
-      [](const array& x, const array& w, const array& b, StreamOrDevice s) {
-        return conv1d_forward(x, w, b, s);
-      },
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::kw_only(),
-      "stream"_a = nb::none()
-  );
+    m.def("conv1d_swish_update_", &conv1d_swish_update, 
+          nb::arg("x"), nb::arg("w"), nb::arg("b"), nb::arg("state"), 
+          nb::kw_only(), nb::arg("stream") = nb::none());
 
-  m.def(
-      "conv1d_swish_update_",
-      [](const array& x, const array& w, const array& b, const array& state, StreamOrDevice s) {
-        return conv1d_swish_update(x, w, b, state, s);
-      },
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::kw_only(),
-      "stream"_a = nb::none()
-  );
+    m.def("conv1d_swish_forward_", &conv1d_swish_forward, 
+          nb::arg("x"), nb::arg("w"), nb::arg("b"), 
+          nb::kw_only(), nb::arg("stream") = nb::none());
 
-  m.def(
-      "conv1d_swish_forward_",
-      [](const array& x, const array& w, const array& b, StreamOrDevice s) {
-        return conv1d_swish_forward(x, w, b, s);
-      },
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::kw_only(),
-      "stream"_a = nb::none()
-  );
+    m.def("ssm_update", &ssm_update, 
+          nb::arg("x"), nb::arg("dt"), nb::arg("A"), nb::arg("B"), nb::arg("C"), nb::arg("D"), nb::arg("z"), nb::arg("state"), 
+          nb::kw_only(), nb::arg("stream") = nb::none());
 
-  m.def(
-      "ssm_update",
-      [](const array& x, const array& dt, const array& A, const array& B, const array& C, const array& D, const array& z, const array& state, StreamOrDevice s) {
-        return ssm_update(x, dt, A, B, C, D, z, state, s);
-      },
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::kw_only(),
-      "stream"_a = nb::none()
-  );
+    m.def("ssd_update_", &ssd_update, 
+          nb::arg("x"), nb::arg("dt"), nb::arg("decay"), nb::arg("B"), nb::arg("C"), nb::arg("D"), nb::arg("z"), nb::arg("state"), 
+          nb::kw_only(), nb::arg("stream") = nb::none());
 
-  m.def(
-      "ssd_update_",
-      [](const array& x, const array& dt, const array& decay, const array& B, const array& C, const array& D, const array& z, const array& state, StreamOrDevice s) {
-        return ssd_update(x, dt, decay, B, C, D, z, state, s);
-      },
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::kw_only(),
-      "stream"_a = nb::none()
-  );
-
-  m.def(
-      "ssd_update_no_z_",
-      [](const array& x, const array& dt, const array& decay, const array& B, const array& C, const array& D, const array& state, StreamOrDevice s) {
-        return ssd_update_no_z(x, dt, decay, B, C, D, state, s);
-      },
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::arg(),
-      nb::kw_only(),
-      "stream"_a = nb::none()
-  );
+    m.def("ssd_update_no_z_", &ssd_update_no_z, 
+          nb::arg("x"), nb::arg("dt"), nb::arg("decay"), nb::arg("B"), nb::arg("C"), nb::arg("D"), nb::arg("state"), 
+          nb::kw_only(), nb::arg("stream") = nb::none());
 }
