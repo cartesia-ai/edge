@@ -14,8 +14,8 @@ Note: This package has been tested on macOS Sonoma 14.1 with the M3 chip.
 ## Models
 
 ### Language Models
-- `cartesia-ai/LlaMamba-v0.1-8B-Instruct-4bit-mlx` 
 - `cartesia-ai/Mohawk-v0.1-1.3B-4bit-mlx` 
+- `cartesia-ai/LlaMamba-v0.1-8B-Instruct-4bit-mlx` 
 - `cartesia-ai/Rene-v0.1-1.3b-4bit-mlx` 
 - `cartesia-ai/mamba2-130m-8bit-mlx` 
 - `cartesia-ai/mamba2-130m-mlx` 
@@ -28,8 +28,12 @@ Note: This package has been tested on macOS Sonoma 14.1 with the M3 chip.
 A simple example script for generation can be found in `cartesia-mlx/example.py`.
 Usage example (clone this repo and run the below from within the `cartesia-mlx` directory):
 ```shell
-python example.py --model cartesia-ai/Rene-v0.1-1.3b-4bit-mlx --prompt "Rene Descartes was"
+python example.py --model cartesia-ai/Mohawk-v0.1-1.3B-4bit-mlx --prompt "Rene Descartes was"
 ```
+
+## Performance
+![Quality/Throughput comparison (1-2B)](assets/quality-throughput.png)
+![LlaMamba scaling](assets/llamamba-scaling.png)
 
 You can pass any of the models listed above to the `--model` argument; for a full list of command-line options, pass `--help`.
 
