@@ -33,8 +33,7 @@ def conv1d_update(
         Output tensor of shape (b, d) and the updated state tensor.
     """
     fn = conv1d_swish_update_ if swish is True else conv1d_update_
-    result = fn(x, w, b, state)
-    return result[0], result[1]
+    return fn(x, w, b, state)
 
 
 @mx.compile
