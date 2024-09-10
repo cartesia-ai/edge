@@ -70,7 +70,7 @@ void Conv1dForward::eval_gpu(const std::vector<array>& inputs, std::vector<array
   kname << "conv1d_forward_kernel_";
   kname << type_to_name(x);
   
-  d.register_library("mlx_ext", metal::get_colocated_mtllib_path);
+  d.register_library("mlx_ext");
   auto kernel = d.get_kernel(kname.str(), "mlx_ext");
   auto& compute_encoder = d.get_command_encoder(s.index);
   compute_encoder->setComputePipelineState(kernel);

@@ -26,21 +26,6 @@ REQUIRES_PYTHON = ">=3.9.0"
 VERSION = main_ns["__version__"]
 
 
-# What packages are required for this module to be executed?
-def get_requirements(path):
-    with open(path, "r") as f:
-        out = f.read().splitlines()
-
-    out = [line.strip() for line in out]
-    return out
-
-
-REQUIRED = get_requirements("requirements.txt")
-# REQUIRED_DEV = get_requirements("requirements-dev.txt")
-# What packages are optional?
-EXTRAS = {}
-
-
 # The rest you shouldn't have to touch too much :)
 # ------------------------------------------------
 # Except, perhaps the License and Trove Classifiers!
@@ -129,8 +114,6 @@ setup(
             "tests.*",
         ]
     ),
-    install_requires=REQUIRED,
-    extras_require=EXTRAS,
     include_package_data=True,
     classifiers=[
         # Trove classifiers

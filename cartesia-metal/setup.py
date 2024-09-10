@@ -6,12 +6,7 @@ from setuptools import setup
 
 NAME = "cartesia-metal"
 
-# Ensure Xcode and mlx is installed
 here = os.path.abspath(os.path.dirname(__file__))
-subprocess.check_call(
-    [sys.executable, "-m", "pip", "install", "-r", os.path.join(here, "requirements.txt")]
-)
-
 
 def parse_version(filename):
     about = {}
