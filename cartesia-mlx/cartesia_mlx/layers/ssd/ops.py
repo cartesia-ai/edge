@@ -52,6 +52,7 @@ def chunk_scan_ref(
     return y
 
 
+@mx.compile
 def chunk_state_ref(dtA_cumsum: mx.array, dt: mx.array, B: mx.array, x: mx.array) -> mx.array:
     """
     Computes the final state for each chunk.
@@ -85,6 +86,7 @@ def chunk_state_ref(dtA_cumsum: mx.array, dt: mx.array, B: mx.array, x: mx.array
     return states
 
 
+@mx.compile
 def state_passing_ref(states: mx.array, dtA_cumsum: mx.array, dh: int, n: int) -> mx.array:
     """
     Passes states through chunks in a recurrent fashion.
@@ -172,9 +174,7 @@ def ssd_forward_chunk_ref(
     n = B.shape[-1]
     if l % cl != 0:
         dt = mx.pad(dt, [(0, 0), (0, cl - (l % cl)), (0, 0)])
-        x = mx.pad(x, [(0, 0), (0, cl - (l % cl)), (0, 0), (0, 0)])
-        B = mx.pad(B, [(0, 0), (0, cl - (l % cl)), (0, 0), (0, 0)])
-        C = mx.pad(C, [(0, 0), (0, cl - (l % cl)), (0, 0), (0, 0)])
+        x, B, C = (mx.pad(t, [(0, 0), (0, cl - (l % cl)), (0, 0), (0, 0)]) for t in (x, B, C))
 
     dt = mx.reshape(dt, (b, h, c, cl))
 
@@ -184,8 +184,7 @@ def ssd_forward_chunk_ref(
 
     dt = dt.swapaxes(1, 2)  # (b, c, h, cl)
 
-    B = mx.reshape(B, (b, c, cl, g, n))
-    C = mx.reshape(C, (b, c, cl, g, n))
+    B, C = (mx.reshape(t, (b, c, cl, g, n)) for t in (B, C))
     x = mx.reshape(x, (b, c, cl, h, dh))
 
     states = chunk_state_ref(dtA_cumsum, dt, B, x)

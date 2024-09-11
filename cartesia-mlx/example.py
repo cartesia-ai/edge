@@ -10,7 +10,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     "--model", default="cartesia-ai/Rene-v0.1-1.3b-4bit-mlx", help="The model name."
 )
-parser.add_argument("--prompt", default="Rene Descartes was" * 100)
+parser.add_argument("--prompt", default="Rene Descartes was")
 parser.add_argument(
     "--max-tokens", type=int, default=500, help="Maximum number of tokens to generate."
 )
