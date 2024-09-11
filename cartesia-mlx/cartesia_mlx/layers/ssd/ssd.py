@@ -5,7 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from cartesia_metal import conv1d_forward, conv1d_update, ssd_update
-from cartesia_mlx.layers.ssd.ops import ssd_forward_attn
+from cartesia_mlx.layers.ssd.ops import ssd_forward
 from cartesia_mlx.utils.configure import Inherit, set_cfg
 
 uniform_init = nn.init.uniform()
@@ -113,7 +113,7 @@ class SSD(nn.Module):
             xBC, [self.d_inner, self.d_inner + self.d_state * self.n_groups], axis=-1
         )
 
-        x, ssm_state = ssd_forward_attn(
+        x, ssm_state = ssd_forward(
             x.reshape(b, l, self.n_heads, self.d_head),
             dt,
             self.A,

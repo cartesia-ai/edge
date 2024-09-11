@@ -38,7 +38,7 @@ Our SSM-based LMs deliver SOTA quality and throughput, with constant tokens per 
 
 <img src="assets/quality-throughput.png" alt="Quality/Throughput comparison (1-2B)" style="width:70%;"/>
 
-At increasing context size, the throughput of transformer-based LMs drops rapidly, and memory consumption skyrockets, making them inefficient. In contrast, our distilled pure-SSM LaMamba retains constant tokens per second (tok/s) and memory consumption, unlocking reasoning capabilities over much larger contexts on-device. This constant memory usage is ideal for edge applications.
+At increasing context size, the throughput of transformer-based LMs drops rapidly, and memory consumption skyrockets, making them inefficient. In contrast, our distilled pure-SSM LlaMamba retains constant tokens per second (tok/s) and memory consumption, unlocking reasoning capabilities over much larger contexts on-device. This constant memory usage is ideal for edge applications.
 
 ![LlaMamba scaling](assets/llamamba-scaling.png)
 

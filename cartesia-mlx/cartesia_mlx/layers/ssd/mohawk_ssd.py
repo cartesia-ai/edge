@@ -5,7 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from cartesia_metal import conv1d_forward, conv1d_update, ssd_update
-from cartesia_mlx.layers.ssd.ops import ssd_forward_attn
+from cartesia_mlx.layers.ssd.ops import ssd_forward
 from cartesia_mlx.layers.ssd.ssd import SSD
 from cartesia_mlx.utils.configure import Inherit, set_cfg
 
@@ -107,7 +107,7 @@ class MohawkSSD(SSD):
 
         x_ = x.reshape(b, l, self.n_heads, self.d_head)
 
-        x, ssm_state = ssd_forward_attn(
+        x, ssm_state = ssd_forward(
             x_ / A_log.reshape(b, l, self.n_heads, 1),  # TODO: A_log.unsqueeze(-1)
             A_log,  # TODO: make sure pseudo dt is in correct shape
             A,
