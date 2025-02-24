@@ -134,10 +134,18 @@ class LM(nn.Module):
         Yields:
             int: Generated token IDs.
         """
+        if verbose:
+            start_time = time.time()
+
         logits, state = self.prefill(prompt_ids.reshape(1, -1))
         y = sample(logits, **sampling_kwargs)
 
         mx.async_eval(y)
+
+        if verbose:
+            mx.eval(y)
+            elapsed_time_prefill = time.time() - start_time
+            nr_tokens_prompt = len(prompt_ids)
 
         def _step(y):
             nonlocal state
@@ -165,7 +173,13 @@ class LM(nn.Module):
         if verbose:
             elapsed_time = time.time() - start_time
             print("\n" + "-" * 50)
-            print(f"Tok/s: {n_tokens / elapsed_time:.2f}")
+            print(
+                f"Prompt: {nr_tokens_prompt} tokens, {nr_tokens_prompt / elapsed_time_prefill:.2f} tokens-per-sec"
+            )
+            print(f"Generation: {n_tokens} tokens, {n_tokens / elapsed_time:.2f} tokens-per-sec")
+
+            peak_mem = mx.metal.get_peak_memory() / 2**30
+            print(f"Peak memory: {peak_mem:.3f} GB")
 
     def prefill(self, x):
         """Prefills the model with given prompt."""

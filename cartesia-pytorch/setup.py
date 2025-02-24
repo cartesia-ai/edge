@@ -35,7 +35,6 @@ def get_requirements(path):
     return out
 
 
-
 # The rest you shouldn't have to touch too much :)
 # ------------------------------------------------
 # Except, perhaps the License and Trove Classifiers!
@@ -117,7 +116,6 @@ class UploadCommand(Command):
         os.system("git push --tags")
 
         sys.exit()
-
 
 
 # Where the magic happens:

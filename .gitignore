@@ -182,3 +182,4 @@ next-env.d.ts
 # .tfstate files
 *.tfstate
 *.tfstate.*
+.aider*

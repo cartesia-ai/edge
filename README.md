@@ -13,7 +13,10 @@ With Edge, you have:
 📏 **Local SSM models:** Edge brings together open-weights SSM models and optimizes them for multiple hardware platforms.
 
 ## What's New
+- **[02/24/2025]**: We have released the Llamba family of distilled models: [Llamba-1B](https://huggingface.co/cartesia-ai/Llamba-1B), [Llamba-3B](https://huggingface.co/cartesia-ai/Llamba-3B), and [Llamba-8B](https://huggingface.co/cartesia-ai/Llamba-8B), distilled from Llama-3.2-1B-Instruct, Llama-3.2-3B-Instruct, and Llama-3.1-8B-Instruct, respectively. The three models are available in PyTorch and MLX, with support for quantization and custom hardware kernels.
+
 - **[08/27/2024]**: We are excited to release Edge and our first openly available small language model, [Rene-v0.1](https://huggingface.co/cartesia-ai/Rene-v0.1-1.3b-pytorch). Rene is available with both PyTorch and MLX with quantization support and custom hardware kernels.
+
 
 ## Available Packages
 Edge currently hosts packages for multiple backends:
@@ -27,4 +30,4 @@ For a full list of the available models in MLX and an example of how to run thes
 ![Language Model](cartesia-mlx/assets/lm-demo.gif)
 
 ## Looking for custom support from Cartesia?
-We got your back! Contact us [here](bit.ly/cartesiaondevice).
+We got your back! Contact us [here](bit.ly/cartesiaondevice)., 

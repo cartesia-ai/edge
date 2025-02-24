@@ -6,7 +6,7 @@
 #include "mlx/backend/common/utils.h"
 #include "mlx/utils.h"
 
-#include "src/conv1d_forward.h"
+#include "src/conv1d_swish_update.h"
 
 #ifdef ACCELERATE_NEW_LAPACK
 #include <vecLib/cblas_new.h>
@@ -17,44 +17,53 @@
 
 namespace mlx::core {
 
-std::vector<array> conv1d_forward(
+std::vector<array> conv1d_swish_update(
     const array& x,
     const array& w, 
     const array& b, 
+    const array& state,
     StreamOrDevice s /* = {} */ // Stream on which to schedule the operation
 ) {
   auto y_dtype = x.dtype();
   // TODO: Also make sure state is of the same dtype
 
   auto y_shape = x.shape();
+  auto state_shape = state.shape();
 
   return array::make_arrays(
-      {y_shape},
-      {y_dtype},
-      std::make_shared<Conv1dForward>(to_stream(s)),
-      {x, w, b});
+      {y_shape, state_shape},
+      {y_dtype, y_dtype},
+      std::make_shared<Conv1dSwishUpdate>(to_stream(s)),
+      {x, w, b, state});
 }
 
-void Conv1dForward::eval(const std::vector<array>& inputs,  std::vector<array>& outputs) {
+
+void Conv1dSwishUpdate::eval(const std::vector<array>& inputs,  std::vector<array>& outputs) {
     throw std::runtime_error("eval not implemented!");
 }
 
+
 #ifdef ACCELERATE_NEW_LAPACK
-void Conv1dForward::eval_cpu(const std::vector<array>& inputs,  std::vector<array>& outputs) {
+
+void Conv1dSwishUpdate::eval_cpu(const std::vector<array>& inputs,  std::vector<array>& outputs) {
     throw std::runtime_error("eval_cpu not implemented!");
 }
+
 #endif
 
-void Conv1dForward::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
 
-  assert(inputs.size() == 3);
-  assert(outputs.size() == 1);
+void Conv1dSwishUpdate::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
 
-  auto x = inputs[0];       // (b, d, l)
-  auto w = inputs[1];       // (d, k)
-  auto b = inputs[2];       // (d)
+  assert(inputs.size() == 4);
+  assert(outputs.size() == 2);
+
+  auto x = inputs[0];
+  auto w = inputs[1];
+  auto b = inputs[2];
+  auto state = inputs[3];
 
   auto y = outputs[0];
+  auto next_state = outputs[1];
 
   auto& s = stream();
   auto& d = metal::device(s.device);
@@ -66,8 +75,15 @@ void Conv1dForward::eval_gpu(const std::vector<array>& inputs, std::vector<array
     x.flags()
   );
 
+  next_state.set_data(
+    allocator::malloc_or_wait(state.data_size() * state.itemsize()),
+    state.data_size(),
+    state.strides(),
+    state.flags()
+  );
+
   std::ostringstream kname;
-  kname << "conv1d_forward_kernel_";
+  kname << "conv1d_swish_update_kernel_";
   kname << type_to_name(x);
   
   d.register_library("mlx_ext");
@@ -76,23 +92,27 @@ void Conv1dForward::eval_gpu(const std::vector<array>& inputs, std::vector<array
   compute_encoder.set_compute_pipeline_state(kernel);
 
   auto kernel_size = w.shape(1);
-  auto batch_size = x.shape(0);
-  auto n_channels = x.shape(1);
-  auto seq_len = x.shape(2);
 
   compute_encoder.set_input_array(x, 0);
   compute_encoder.set_input_array(w, 1);
   compute_encoder.set_input_array(b, 2);
-  compute_encoder.set_output_array(y, 3);
-  compute_encoder.set_bytes(x.strides().data(), 3 * sizeof(size_t), 4);
-  compute_encoder.set_bytes(&kernel_size, kernel_size * sizeof(int), 5);
+  compute_encoder.set_input_array(state, 3);
+  compute_encoder.set_output_array(y, 4);
+  compute_encoder.set_output_array(next_state, 5);
+  compute_encoder.set_bytes(&kernel_size, kernel_size * sizeof(int), 6);
+  compute_encoder.set_bytes(x.strides().data(), 2 * sizeof(size_t), 7);
+  compute_encoder.set_bytes(state.strides().data(), 3 * sizeof(size_t), 8);
   
 
+  auto batch_size = x.shape(0);
+  auto n_channels = x.shape(1);
+
   // https://developer.apple.com/documentation/metal/compute_passes/calculating_threadgroup_and_grid_sizes
-  MTL::Size grid_dims = MTL::Size(batch_size, n_channels, seq_len);
+  MTL::Size grid_dims = MTL::Size(batch_size, n_channels, 1);
   size_t width = kernel->threadExecutionWidth();
   size_t height = kernel->maxTotalThreadsPerThreadgroup() / width; 
   MTL::Size group_dims = MTL::Size(width, height, 1);
+  
   compute_encoder.dispatch_threads(grid_dims, group_dims);
 }
 

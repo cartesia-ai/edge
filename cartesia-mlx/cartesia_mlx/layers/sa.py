@@ -105,8 +105,6 @@ class SelfAttention(nn.Module):
         if x.dtype != dtype:
             x = x.astype(dtype)
 
-        if self.kv_heads == self.n_heads:
-            x = x[0]  # scaled_dot_product_attention outputs different shapes for mha / mqa
         x = x.transpose(0, 2, 1, 3).reshape(b, l, -1)
 
         x = self.out_proj(x)
@@ -164,5 +162,5 @@ def _construct_mask(
             context_mask_upper = mx.where(context_mask_upper == 0, float("-inf"), 0)
             context_mask += context_mask_upper
         mask_lq_x_lkv += context_mask.reshape(1, l_q, l_kv)
-    mask_lq_x_lkv = mask_lq_x_lkv.reshape(b, 1, 1, l_q, l_kv)
+    mask_lq_x_lkv = mask_lq_x_lkv.reshape(b, 1, l_q, l_kv)
     return mask_lq_x_lkv

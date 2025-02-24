@@ -7,9 +7,7 @@ import cartesia_mlx as cmx
 parser = argparse.ArgumentParser(
     description="Simple example script to run a Cartesia MLX language model."
 )
-parser.add_argument(
-    "--model", default="cartesia-ai/Rene-v0.1-1.3b-4bit-mlx", help="The model name."
-)
+parser.add_argument("--model", default="cartesia-ai/Llamba-1B-4bit-mlx", help="The model name.")
 parser.add_argument("--prompt", default="Rene Descartes was")
 parser.add_argument(
     "--max-tokens", type=int, default=500, help="Maximum number of tokens to generate."
@@ -34,7 +32,7 @@ print(prompt, end="", flush=True)
 for text in model.generate(
     prompt,
     max_tokens=args.max_tokens,
-    eval_every_n=5,
+    eval_every_n=1,
     verbose=True,
     top_p=args.top_p,
     temperature=args.temperature,

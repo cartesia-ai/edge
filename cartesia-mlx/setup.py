@@ -24,21 +24,16 @@ EMAIL = "support@cartesia.ai"
 AUTHOR = "Cartesia, Inc."
 REQUIRES_PYTHON = ">=3.9.0"
 VERSION = main_ns["__version__"]
-
-
-# What packages are required for this module to be executed?
-def get_requirements(path):
-    with open(path, "r") as f:
-        out = f.read().splitlines()
-
-    out = [line.strip() for line in out]
-    return out
-
-
-REQUIRED = get_requirements("requirements.txt")
-# REQUIRED_DEV = get_requirements("requirements-dev.txt")
-# What packages are optional?
-EXTRAS = {}
+REQUIRES = [
+    "mlx==0.22.1",
+    "nanobind==2.4.0",
+    "transformers>=4.40.0",
+    "datasets",
+    "torch",
+    "numpy<2",
+    "requests",
+    "huggingface_hub"
+]
 
 
 # The rest you shouldn't have to touch too much :)
@@ -129,8 +124,7 @@ setup(
             "tests.*",
         ]
     ),
-    install_requires=REQUIRED,
-    extras_require=EXTRAS,
+    install_requires=REQUIRES,
     include_package_data=True,
     classifiers=[
         # Trove classifiers

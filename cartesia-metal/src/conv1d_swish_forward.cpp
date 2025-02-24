@@ -6,7 +6,7 @@
 #include "mlx/backend/common/utils.h"
 #include "mlx/utils.h"
 
-#include "src/conv1d_forward.h"
+#include "src/conv1d_swish_forward.h"
 
 #ifdef ACCELERATE_NEW_LAPACK
 #include <vecLib/cblas_new.h>
@@ -17,7 +17,7 @@
 
 namespace mlx::core {
 
-std::vector<array> conv1d_forward(
+std::vector<array> conv1d_swish_forward(
     const array& x,
     const array& w, 
     const array& b, 
@@ -31,21 +31,21 @@ std::vector<array> conv1d_forward(
   return array::make_arrays(
       {y_shape},
       {y_dtype},
-      std::make_shared<Conv1dForward>(to_stream(s)),
+      std::make_shared<Conv1dSwishForward>(to_stream(s)),
       {x, w, b});
 }
 
-void Conv1dForward::eval(const std::vector<array>& inputs,  std::vector<array>& outputs) {
+void Conv1dSwishForward::eval(const std::vector<array>& inputs,  std::vector<array>& outputs) {
     throw std::runtime_error("eval not implemented!");
 }
 
 #ifdef ACCELERATE_NEW_LAPACK
-void Conv1dForward::eval_cpu(const std::vector<array>& inputs,  std::vector<array>& outputs) {
+void Conv1dSwishForward::eval_cpu(const std::vector<array>& inputs,  std::vector<array>& outputs) {
     throw std::runtime_error("eval_cpu not implemented!");
 }
 #endif
 
-void Conv1dForward::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+void Conv1dSwishForward::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
 
   assert(inputs.size() == 3);
   assert(outputs.size() == 1);
@@ -67,7 +67,7 @@ void Conv1dForward::eval_gpu(const std::vector<array>& inputs, std::vector<array
   );
 
   std::ostringstream kname;
-  kname << "conv1d_forward_kernel_";
+  kname << "conv1d_swish_forward_kernel_";
   kname << type_to_name(x);
   
   d.register_library("mlx_ext");

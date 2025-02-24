@@ -93,10 +93,10 @@ void SSDUpdate::eval_gpu(const std::vector<array>& inputs, std::vector<array>& o
   kname << "ssd_update_kernel_";
   kname << type_to_name(x);
   
-  d.register_library("mlx_ext", metal::get_colocated_mtllib_path);
+  d.register_library("mlx_ext");
   auto kernel = d.get_kernel(kname.str(), "mlx_ext");
   auto& compute_encoder = d.get_command_encoder(s.index);
-  compute_encoder->setComputePipelineState(kernel);
+  compute_encoder.set_compute_pipeline_state(kernel);
 
   compute_encoder.set_input_array(x, 0);
   compute_encoder.set_input_array(dt, 1);
@@ -117,13 +117,12 @@ void SSDUpdate::eval_gpu(const std::vector<array>& inputs, std::vector<array>& o
   auto g = B.shape(1);
   auto group_size = h / g;
 
-  compute_encoder->setBytes(&group_size, sizeof(size_t), 10);
-  compute_encoder->setBytes(&state_size, sizeof(size_t), 11);
-
-  compute_encoder->setBytes(x.strides().data(), 3 * sizeof(size_t), 12);
-  compute_encoder->setBytes(dt.strides().data(), 2 * sizeof(size_t), 13);
-  compute_encoder->setBytes(B.strides().data(), 3 * sizeof(size_t), 14);
-  compute_encoder->setBytes(state.strides().data(), 4 * sizeof(size_t), 15);
+  compute_encoder.set_bytes(&group_size, sizeof(size_t), 10);
+  compute_encoder.set_bytes(&state_size, sizeof(size_t), 11);
+  compute_encoder.set_bytes(x.strides().data(), 3 * sizeof(size_t), 12);
+  compute_encoder.set_bytes(dt.strides().data(), 2 * sizeof(size_t), 13);
+  compute_encoder.set_bytes(B.strides().data(), 3 * sizeof(size_t), 14);
+  compute_encoder.set_bytes(state.strides().data(), 4 * sizeof(size_t), 15);
 
   // https://developer.apple.com/documentation/metal/compute_passes/calculating_threadgroup_and_grid_sizes
   MTL::Size grid_dims = MTL::Size(b, h, dh);
@@ -131,7 +130,7 @@ void SSDUpdate::eval_gpu(const std::vector<array>& inputs, std::vector<array>& o
   // size_t height = kernel->maxTotalThreadsPerThreadgroup() / width; 
   MTL::Size group_dims = MTL::Size(32, 32, 1);
   
-  compute_encoder->dispatchThreads(grid_dims, group_dims);
+  compute_encoder.dispatch_threads(grid_dims, group_dims);
 }
 
 } // namespace mlx::core

@@ -136,7 +136,12 @@ class ReneMHA(nn.Module):
             attn_mask = None
             is_causal_arg = True
         return F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=is_causal_arg, scale=self.softmax_scale
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            is_causal=is_causal_arg,
+            scale=self.softmax_scale,
         ).transpose(1, 2)
 
     def _update_kv_cache(self, kv, inference_params):
@@ -182,7 +187,8 @@ class ReneMHA(nn.Module):
             )
         qkv = self.in_proj(x)
         q, kv = qkv.split(
-            [self.num_heads * self.head_dim, self.num_heads_kv * 2 * self.head_dim], dim=-1
+            [self.num_heads * self.head_dim, self.num_heads_kv * 2 * self.head_dim],
+            dim=-1,
         )
         q = rearrange(q, "... (h d) -> ... h d", d=self.head_dim)
         kv = rearrange(kv, "... (two hkv d) -> ... two hkv d", two=2, d=self.head_dim)
@@ -414,7 +420,12 @@ class ReneLMHeadModel(PreTrainedModel, MambaGenerationMixin):
         return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
     def forward(
-        self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0, **mixer_kwargs
+        self,
+        input_ids,
+        position_ids=None,
+        inference_params=None,
+        num_last_tokens=0,
+        **mixer_kwargs,
     ):
         """
         "position_ids" is just to be compatible with Transformer generation. We don't use it.

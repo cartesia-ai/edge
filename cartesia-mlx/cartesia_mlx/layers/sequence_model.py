@@ -9,6 +9,7 @@ from cartesia_mlx.layers.residual_block import ResidualBlock
 from cartesia_mlx.layers.sa import SelfAttention
 from cartesia_mlx.layers.ssd.ssd import SSD
 from cartesia_mlx.utils.configure import Inherit, instantiate, set_cfg, sub_cfg
+from cartesia_mlx.utils.registry import NORMS
 
 State = Union[mx.array, Tuple[mx.array]]
 
@@ -30,14 +31,16 @@ class SequenceModel(nn.Module):
             sub_cfg(ResidualBlock.base_cfg, layer=SSD.base_cfg),
         ],
         post_norm=True,
+        pre_norm=False,
         final_proj=False,
+        norm_type="rms",
     )
 
     def __init__(self, cfg=None, parent=None):
         super().__init__()
         set_cfg(self, cfg, parent)
-        if self.post_norm:
-            self.norm = nn.RMSNorm(self.d_model)
+        if self.post_norm or self.pre_norm:
+            self.norm = NORMS[self.norm_type](self.d_model)
         layers = [self.unique_layers] * self.n_layer_repeats
         layers = flatten([copy.deepcopy(layer) for layer in layers])
         self.layers = [instantiate(layer, parent=self) for layer in layers]
@@ -64,6 +67,8 @@ class SequenceModel(nn.Module):
         Returns:
             The output tensor and the next state.
         """
+        if self.pre_norm:
+            x = self.norm(x)
         next_state = []
         for i, layer in enumerate(self.layers):
             state_i = state[i] if state else None
@@ -89,6 +94,8 @@ class SequenceModel(nn.Module):
         Returns:
             The output and the next state.
         """
+        if self.pre_norm:
+            x = self.norm(x)
         next_state = []
         for i, layer in enumerate(self.layers):
             state_i = state[i] if state else None

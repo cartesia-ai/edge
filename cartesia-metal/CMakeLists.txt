@@ -29,6 +29,8 @@ target_sources(
   PUBLIC
   ${CMAKE_CURRENT_LIST_DIR}/src/conv1d_update.cpp
   ${CMAKE_CURRENT_LIST_DIR}/src/conv1d_forward.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/src/conv1d_swish_update.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/src/conv1d_swish_forward.cpp
   ${CMAKE_CURRENT_LIST_DIR}/src/ssm_update.cpp
   ${CMAKE_CURRENT_LIST_DIR}/src/ssd_update.cpp
   ${CMAKE_CURRENT_LIST_DIR}/src/ssd_update_no_z.cpp
@@ -52,6 +54,8 @@ if(MLX_BUILD_METAL)
     SOURCES 
         ${CMAKE_CURRENT_LIST_DIR}/src/conv1d_update.metal
         ${CMAKE_CURRENT_LIST_DIR}/src/conv1d_forward.metal
+        ${CMAKE_CURRENT_LIST_DIR}/src/conv1d_swish_update.metal
+        ${CMAKE_CURRENT_LIST_DIR}/src/conv1d_swish_forward.metal
         ${CMAKE_CURRENT_LIST_DIR}/src/ssm_update.metal
         ${CMAKE_CURRENT_LIST_DIR}/src/ssd_update.metal
         ${CMAKE_CURRENT_LIST_DIR}/src/ssd_update_no_z.metal

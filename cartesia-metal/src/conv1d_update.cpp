@@ -86,10 +86,10 @@ void Conv1dUpdate::eval_gpu(const std::vector<array>& inputs, std::vector<array>
   kname << "conv1d_update_kernel_";
   kname << type_to_name(x);
   
-  d.register_library("mlx_ext", metal::get_colocated_mtllib_path);
+  d.register_library("mlx_ext");
   auto kernel = d.get_kernel(kname.str(), "mlx_ext");
   auto& compute_encoder = d.get_command_encoder(s.index);
-  compute_encoder->setComputePipelineState(kernel);
+  compute_encoder.set_compute_pipeline_state(kernel);
 
   auto kernel_size = w.shape(1);
 
@@ -99,9 +99,9 @@ void Conv1dUpdate::eval_gpu(const std::vector<array>& inputs, std::vector<array>
   compute_encoder.set_input_array(state, 3);
   compute_encoder.set_output_array(y, 4);
   compute_encoder.set_output_array(next_state, 5);
-  compute_encoder->setBytes(&kernel_size, kernel_size * sizeof(int), 6);
-  compute_encoder->setBytes(x.strides().data(), 2 * sizeof(size_t), 7);
-  compute_encoder->setBytes(state.strides().data(), 3 * sizeof(size_t), 8);
+  compute_encoder.set_bytes(&kernel_size, kernel_size * sizeof(int), 6);
+  compute_encoder.set_bytes(x.strides().data(), 2 * sizeof(size_t), 7);
+  compute_encoder.set_bytes(state.strides().data(), 3 * sizeof(size_t), 8);
 
   auto batch_size = x.shape(0);
   auto n_channels = x.shape(1);
@@ -112,7 +112,7 @@ void Conv1dUpdate::eval_gpu(const std::vector<array>& inputs, std::vector<array>
   size_t height = kernel->maxTotalThreadsPerThreadgroup() / width; 
   MTL::Size group_dims = MTL::Size(width, height, 1);
   
-  compute_encoder->dispatchThreads(grid_dims, group_dims);
+  compute_encoder.dispatch_threads(grid_dims, group_dims);
 }
 
 } // namespace mlx::core
