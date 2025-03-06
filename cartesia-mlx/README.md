@@ -16,6 +16,7 @@ Note: This package has been tested on macOS Sonoma 14.1 with the M3 chip.
 ### Language Models
 - `cartesia-ai/Llamba-1B-4bit-mlx` 
 - `cartesia-ai/Llamba-3B-4bit-mlx`
+- `cartesia-ai/Llamba-8B-4bit-mlx`
 - `cartesia-ai/Llamba-8B-8bit-mlx`
 - `cartesia-ai/Mohawk-v0.1-1.3B-4bit-mlx` 
 - `cartesia-ai/Rene-v0.1-1.3b-4bit-mlx` 

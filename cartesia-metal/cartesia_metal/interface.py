@@ -79,6 +79,7 @@ def ssd_update(
     dt_max: float,
     state: mx.array,
     softplus: bool = True,
+    flip_A_sign: bool = False,
     z: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
     """Updates the state space model with the given inputs and parameters.
@@ -109,10 +110,14 @@ def ssd_update(
 
     dt = mx.clip(dt, a_min=dt_min, a_max=dt_max).astype(dt.dtype)
 
+    log_decay = dt
     if A is not None:
-        decay = mx.exp(dt * A.reshape(1, -1))  # (b, h)
-    else:
-        decay = mx.exp(dt)
+        log_decay = log_decay * A.reshape(1, -1)
+
+    if flip_A_sign is True:
+        log_decay = -log_decay
+
+    decay = mx.exp(log_decay)
 
     if z is not None:
         x, state = ssd_update_(x, dt, decay, B, C, D, z, state)
