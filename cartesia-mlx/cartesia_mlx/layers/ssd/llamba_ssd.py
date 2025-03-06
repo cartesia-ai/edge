@@ -116,7 +116,7 @@ class LlambaSSD(SSD):
             C.reshape(b, l, self.n_heads, -1),
             D,
             dt_bias,
-            dt_min=self.dt_limit[0],
+            dt_min=0,
             dt_max=self.dt_limit[1],
             softplus=True,
         )
@@ -183,7 +183,7 @@ class LlambaSSD(SSD):
             C,
             D,
             dt_bias,
-            dt_min=self.dt_limit[0],
+            dt_min=0,
             dt_max=self.dt_limit[1],
             state=ssm_state,
             softplus=True,

@@ -155,6 +155,7 @@ def ssd_forward_chunk_ref(
         y: Output tensor of shape (batch_size, length, num_heads * head_dim).
         final_state: Final state of shape (batch_size, num_heads, head_dim, n).
     """
+    raise NotImplementedError # TODO: fix bug
     b, l, h, dh = x.shape
     _, _, g, n = B.shape
     cl = chunk_size
@@ -232,6 +233,7 @@ def ssd_forward_attn(
         dt_min: Minimum value for time deltas after clipping.
         dt_max: Maximum value for time deltas after clipping.
     """
+    
     b, l, h, dh = x.shape
     _, _, g, _ = B.shape
 
@@ -284,6 +286,7 @@ def ssd_forward(
     softplus: bool = True,
     chunk_size: int = 128,
     chunk_min_len: int = 256,
+    enable_chunked: bool = False,
 ) -> Tuple[mx.array, mx.array]:
     """
     SSD-SSM forward pass that switches between chunking, attention, and update modes.
@@ -306,8 +309,9 @@ def ssd_forward(
         y: Output tensor of shape (batch_size, length, num_heads * head_dim).
         state: Final state of the forward pass.
     """
-    if x.shape[1] < chunk_min_len:
+    if enable_chunked is False or x.shape[1] < chunk_min_len:
         return ssd_forward_attn(x, dt, A, B, C, D, dt_bias, dt_min, dt_max, softplus)
+    raise NotImplementedError # TODO: fix bug in ssd_forward_chunk_ref
     return ssd_forward_chunk_ref(x, dt, A, B, C, D, dt_bias, dt_min, dt_max, softplus, chunk_size)
 
 
