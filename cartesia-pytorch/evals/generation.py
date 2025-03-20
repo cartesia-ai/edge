@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 
 from cartesia_pytorch.Llamba.llamba import LlambaLMHeadModel
 from cartesia_pytorch.Rene.rene import ReneLMHeadModel
+from cartesia_pytorch.quantize_model import QuantizationConfig, ModelQuantizer, quantize_model_from_name
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -36,6 +37,14 @@ def parse_args():
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--min_p", type=float, default=0.0)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
+    
+    # Quantization arguments
+    parser.add_argument("--quantize", action="store_true", help="Enable model quantization")
+    parser.add_argument("--bits", type=int, default=8, choices=[4, 8, 16], help="Quantization bit width")
+    parser.add_argument("--group_size", type=int, default=128, help="Group size for quantization")
+    parser.add_argument("--symmetric", action="store_true", help="Use symmetric quantization")
+    parser.add_argument("--save_quantized", type=str, default="", help="Path to save the quantized model")
+    
     return parser.parse_args()
 
 
@@ -74,6 +83,30 @@ def choose_model(args):
         tokenizer = AutoTokenizer.from_pretrained("allenai/OLMo-1B-hf")
     else:
         raise NotImplementedError
+    
+    # Apply quantization if requested
+    if args.quantize:
+        print(f"Quantizing model to {args.bits} bits...")
+        config = QuantizationConfig(
+            bits=args.bits,
+            group_size=args.group_size,
+            sym=args.symmetric,
+            per_channel=True,
+            use_cuda_kernels=device == "cuda"
+        )
+        model = ModelQuantizer.quantize_model(model, config)
+        
+        # Save quantized model if requested
+        if args.save_quantized:
+            print(f"Saving quantized model to {args.save_quantized}")
+            ModelQuantizer.export_model(model, args.save_quantized, {
+                'original_model': args.model,
+                'quantization_config': {
+                    'bits': args.bits,
+                    'group_size': args.group_size,
+                    'symmetric': args.symmetric
+                }
+            })
 
     return model, tokenizer
 
@@ -90,7 +123,8 @@ def main():
 
     # Prepare model
     model.to(device=device)
-    model.to(dtype=getattr(torch, args.dtype))
+    if not args.quantize:  # Only set dtype if not quantized
+        model.to(dtype=getattr(torch, args.dtype))
     model.eval()
     print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
 
