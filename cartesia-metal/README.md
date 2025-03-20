@@ -12,7 +12,6 @@ sudo xcodebuild -license
 
 Install the dependency nanobind (exact version required), followed by cartesia-metal:
 ```shell 
-pip install nanobind@git+https://github.com/wjakob/nanobind.git@2f04eac452a6d9142dedb957701bdb20125561e4
 pip install git+https://github.com/cartesia-ai/edge.git#subdirectory=cartesia-metal
 ```
 
