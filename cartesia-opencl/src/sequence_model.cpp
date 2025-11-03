@@ -3,6 +3,7 @@
 #include "layers/rms_norm_layer.h"
 #include <stdexcept>
 #include <CL/cl.h>
+#include <iostream>
 
 namespace cartesia_opencl {
 
@@ -89,25 +90,90 @@ cl_mem SequenceModel::step(
     
     // Process through each layer
     for (size_t i = 0; i < layers_.size(); ++i) {
-        LayerState* layer_state = &((*state)[i]);
-        
-        if (layers_[i]->isStateful()) {
-            current = layers_[i]->step(current, batch_size, layer_state, queue);
-        } else {
-            LayerState dummy_state = LayerState::null();
-            current = layers_[i]->step(current, batch_size, &dummy_state, queue);
+        try {
+            std::cout << "    [SeqModel] step layer " << i << "..." << std::flush;
+            
+            // Validate input buffer before layer
+            if (!current) {
+                throw std::runtime_error("Layer " + std::to_string(i) + " received null input buffer");
+            }
+            
+            LayerState* layer_state = &((*state)[i]);
+            
+            // Validate state buffers for stateful layers
+            if (layers_[i]->isStateful() && layer_state && !layer_state->is_null()) {
+                if (layer_state->state1) {
+                    // Quick validation - check if buffer is valid by trying to get info (non-destructive)
+                    cl_int info_err;
+                    size_t buf_size = 0;
+                    info_err = clGetMemObjectInfo(layer_state->state1, CL_MEM_SIZE, sizeof(size_t), &buf_size, nullptr);
+                    if (info_err != CL_SUCCESS) {
+                        throw std::runtime_error("Layer " + std::to_string(i) + " has invalid state1 buffer (err=" + std::to_string(info_err) + ")");
+                    }
+                }
+            }
+            
+            if (layers_[i]->isStateful()) {
+                current = layers_[i]->step(current, batch_size, layer_state, queue);
+                if (!current) {
+                    throw std::runtime_error("Layer " + std::to_string(i) + " returned null buffer");
+                }
+            } else {
+                LayerState dummy_state = LayerState::null();
+                current = layers_[i]->step(current, batch_size, &dummy_state, queue);
+                if (!current) {
+                    throw std::runtime_error("Layer " + std::to_string(i) + " returned null buffer");
+                }
+            }
+            
+            // Validate output buffer
+            cl_int info_err;
+            size_t buf_size = 0;
+            info_err = clGetMemObjectInfo(current, CL_MEM_SIZE, sizeof(size_t), &buf_size, nullptr);
+            if (info_err != CL_SUCCESS) {
+                throw std::runtime_error("Layer " + std::to_string(i) + " returned invalid buffer (err=" + std::to_string(info_err) + ")");
+            }
+            
+            std::cout << " ✓" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "\n    [SeqModel] ERROR in layer " << i << ": " << e.what() << std::endl;
+            throw;
+        } catch (...) {
+            std::cerr << "\n    [SeqModel] FATAL: Unknown exception in layer " << i << std::endl;
+            throw;
         }
     }
     
+    std::cout << "    [SeqModel] All layers complete, checking post-norm..." << std::flush;
+    
     // Apply post-norm if needed
     if (use_post_norm_ && post_norm_) {
-        if (!norm_layer_) {
-            // Initialize norm layer if not already done
-            norm_layer_ = std::make_unique<RMSNormLayer>(ctx_, d_model_);
-            std::vector<float> norm_weights(d_model_, 1.0f);
-            norm_layer_->initializeWeights(norm_weights);
+        try {
+            if (!norm_layer_) {
+                std::cout << "\n      [SeqModel] Initializing post-norm layer..." << std::flush;
+                // Initialize norm layer if not already done
+                norm_layer_ = std::make_unique<RMSNormLayer>(ctx_, d_model_);
+                std::vector<float> norm_weights(d_model_, 1.0f);
+                norm_layer_->initializeWeights(norm_weights);
+                std::cout << " ✓" << std::flush;
+            }
+            std::cout << "\n      [SeqModel] Running post-norm step..." << std::flush;
+            cl_mem norm_output = norm_layer_->step(current, batch_size, queue);
+            if (!norm_output) {
+                throw std::runtime_error("Post-norm step returned null buffer");
+            }
+            current = norm_output;
+            std::cout << " ✓" << std::flush;
+        } catch (const std::exception& e) {
+            std::cerr << "\n    [SeqModel] ERROR in post-norm: " << e.what() << std::endl;
+            throw;
         }
-        current = norm_layer_->step(current, batch_size, queue);
+    }
+    
+    std::cout << "\n    [SeqModel] step complete, returning buffer" << std::endl;
+    
+    if (!current) {
+        throw std::runtime_error("SequenceModel::step returning null buffer");
     }
     
     return current;

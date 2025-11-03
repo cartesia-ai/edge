@@ -445,23 +445,40 @@ int main(int argc, char* argv[]) {
         int current_token_id = prompt_tokens.back();  // Placeholder - should be sampled from last logits
         
         for (int i = 0; i < max_tokens; ++i) {
+            std::cout << "[Gen] Step " << (i+1) << " / " << max_tokens << std::endl;
+            cl_mem current_token_buf = nullptr;
+            cl_mem current_embedding = nullptr;
+            cl_mem next_hidden = nullptr;
+            cl_mem logits = nullptr;
             try {
+                std::cout << "  [Gen] EncodeStep: token_id=" << current_token_id << std::endl;
                 // Encode current token
                 std::vector<int32_t> current_token_vec = {current_token_id};
-                cl_mem current_token_buf = createTokenBuffer(context, current_token_vec);
-                cl_mem current_embedding = embedding.encodeStep(current_token_buf, batch_size, queue);
+                current_token_buf = createTokenBuffer(context, current_token_vec);
+                current_embedding = embedding.encodeStep(current_token_buf, batch_size, queue);
+                if (!current_embedding) throw std::runtime_error("encodeStep returned null buffer");
+                std::cout << "  [Gen] EncodeStep ✓" << std::endl;
                 
                 // Step through sequence model
-                cl_mem next_hidden = seq_model.step(current_embedding, batch_size, &states, queue);
+                next_hidden = seq_model.step(current_embedding, batch_size, &states, queue);
+                if (!next_hidden) throw std::runtime_error("seq_model.step returned null buffer");
+                std::cout << "  [Gen] seq_model.step ✓" << std::endl;
                 
                 // Get logits from LM head
-                cl_mem logits = lm_head.forward(next_hidden, batch_size, queue);
+                logits = lm_head.forward(next_hidden, batch_size, queue);
+                if (!logits) throw std::runtime_error("LMHead.forward returned null buffer");
+                std::cout << "  [Gen] LMHead.forward ✓" << std::endl;
+                
+                // Ensure all writes are visible before CPU read in sampler
+                clFinish(queue);
+                std::cout << "  [Gen] clFinish ✓" << std::endl;
                 
                 // Sample next token (use TEST_VOCAB_SIZE)
                 int next_token = sampler.sampleFromBuffer(
                     logits, TEST_VOCAB_SIZE, queue,
                     DEFAULT_TOP_P, DEFAULT_TEMPERATURE
                 );
+                std::cout << "  [Gen] sample ✓ -> token=" << next_token << std::endl;
                 
                 // Clamp token ID to valid range
                 if (next_token >= TEST_VOCAB_SIZE) {
@@ -474,20 +491,30 @@ int main(int argc, char* argv[]) {
                 // Check for EOS
                 if (next_token == EOS_TOKEN_ID) {
                     std::cout << "Generated EOS token, stopping generation" << std::endl;
+                    // Cleanup temporary buffers
+                    if (current_token_buf) clReleaseMemObject(current_token_buf);
+                    if (current_embedding) clReleaseMemObject(current_embedding);
+                    if (next_hidden) clReleaseMemObject(next_hidden);
+                    if (logits) clReleaseMemObject(logits);
                     break;
                 }
                 
                 // Cleanup temporary buffers
-                clReleaseMemObject(current_token_buf);
-                clReleaseMemObject(current_embedding);
-                clReleaseMemObject(next_hidden);
-                clReleaseMemObject(logits);
+                if (current_token_buf) { clReleaseMemObject(current_token_buf); current_token_buf = nullptr; }
+                if (current_embedding) { clReleaseMemObject(current_embedding); current_embedding = nullptr; }
+                if (next_hidden) { clReleaseMemObject(next_hidden); next_hidden = nullptr; }
+                if (logits) { clReleaseMemObject(logits); logits = nullptr; }
                 
                 if ((i + 1) % 10 == 0) {
                     std::cout << "Generated " << (i + 1) << " tokens..." << std::endl;
                 }
             } catch (const std::exception& e) {
                 std::cerr << "Error during generation step " << (i + 1) << ": " << e.what() << std::endl;
+                // Ensure we free any allocated buffers on error to avoid driver crashes
+                if (current_token_buf) { clReleaseMemObject(current_token_buf); current_token_buf = nullptr; }
+                if (current_embedding) { clReleaseMemObject(current_embedding); current_embedding = nullptr; }
+                if (next_hidden) { clReleaseMemObject(next_hidden); next_hidden = nullptr; }
+                if (logits) { clReleaseMemObject(logits); logits = nullptr; }
                 break;
             }
         }

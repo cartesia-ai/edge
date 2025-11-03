@@ -215,30 +215,47 @@ cl_mem LinearLayer::forward(cl_mem input, int batch_size, int seq_len, cl_comman
     int total_rows = batch_size * seq_len;
     size_t output_size = total_rows * output_dim_ * sizeof(float);
     
-    // Allocate output buffer
-    if (!output_buffer_ || output_buffer_size_ < output_size) {
-        if (output_buffer_) clReleaseMemObject(output_buffer_);
-        output_buffer_ = clCreateBuffer(context, CL_MEM_WRITE_ONLY, output_size, nullptr, nullptr);
-        if (!output_buffer_) {
-            throw std::runtime_error("Failed to create linear layer output buffer");
+    // Allocate output buffer (always recreate to avoid stale handles on some drivers)
+    if (output_buffer_) { clReleaseMemObject(output_buffer_); output_buffer_ = nullptr; }
+    {
+        cl_int buf_err = CL_SUCCESS;
+        output_buffer_ = clCreateBuffer(context, CL_MEM_READ_WRITE, output_size, nullptr, &buf_err);
+        if (buf_err != CL_SUCCESS || !output_buffer_) {
+            std::stringstream ss; ss << "Failed to create linear layer output buffer (forward), err=" << buf_err
+            << ", size=" << output_size;
+            throw std::runtime_error(ss.str());
         }
         output_buffer_size_ = output_size;
     }
     
     // Set kernel arguments for matmul
     // A: input [batch*seq_len, input_dim], B: weights [input_dim, output_dim], C: output [batch*seq_len, output_dim]
+    if (!program_ || !matmul_kernel_) {
+        buildKernels();
+    }
+    if (!input || !weights_buffer_ || !output_buffer_) {
+        std::stringstream ss; ss << "Invalid buffers in LinearLayer::forward: "
+        << " input=" << (input?"ok":"null")
+        << " weights=" << (weights_buffer_?"ok":"null")
+        << " output=" << (output_buffer_?"ok":"null");
+        throw std::runtime_error(ss.str());
+    }
+    clFinish(queue);
     cl_int err;
     err = clSetKernelArg(matmul_kernel_, 0, sizeof(cl_mem), &input);
-    err |= clSetKernelArg(matmul_kernel_, 1, sizeof(cl_mem), &weights_buffer_);
-    err |= clSetKernelArg(matmul_kernel_, 2, sizeof(cl_mem), &output_buffer_);
-    err |= clSetKernelArg(matmul_kernel_, 3, sizeof(int), &total_rows);  // m
-    err |= clSetKernelArg(matmul_kernel_, 4, sizeof(int), &input_dim_);  // k
-    err |= clSetKernelArg(matmul_kernel_, 5, sizeof(int), &output_dim_); // n
-    err |= clSetKernelArg(matmul_kernel_, 6, sizeof(int), &batch_size);   // batch_size (1 for flattened view)
-    
-    if (err != CL_SUCCESS) {
-        throw std::runtime_error("Failed to set matmul kernel arguments");
-    }
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 0 (input) err=") + std::to_string(err)); }
+    err = clSetKernelArg(matmul_kernel_, 1, sizeof(cl_mem), &weights_buffer_);
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 1 (weights) err=") + std::to_string(err)); }
+    err = clSetKernelArg(matmul_kernel_, 2, sizeof(cl_mem), &output_buffer_);
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 2 (output) err=") + std::to_string(err)); }
+    err = clSetKernelArg(matmul_kernel_, 3, sizeof(int), &total_rows);  // m
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 3 (m) err=") + std::to_string(err)); }
+    err = clSetKernelArg(matmul_kernel_, 4, sizeof(int), &input_dim_);  // k
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 4 (k) err=") + std::to_string(err)); }
+    err = clSetKernelArg(matmul_kernel_, 5, sizeof(int), &output_dim_); // n
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 5 (n) err=") + std::to_string(err)); }
+    err = clSetKernelArg(matmul_kernel_, 6, sizeof(int), &batch_size);   // batch_size (1 for flattened view)
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 6 (batch_size) err=") + std::to_string(err)); }
     
     // Execute kernel
     size_t global_size[2] = {static_cast<size_t>(total_rows), static_cast<size_t>(output_dim_)};
@@ -288,12 +305,15 @@ cl_mem LinearLayer::step(cl_mem input, int batch_size, cl_command_queue queue) {
     cl_context context = ctx_->getContext();
     size_t output_size = batch_size * output_dim_ * sizeof(float);
     
-    // Allocate output buffer
-    if (!output_buffer_ || output_buffer_size_ < output_size) {
-        if (output_buffer_) clReleaseMemObject(output_buffer_);
-        output_buffer_ = clCreateBuffer(context, CL_MEM_WRITE_ONLY, output_size, nullptr, nullptr);
-        if (!output_buffer_) {
-            throw std::runtime_error("Failed to create linear layer output buffer");
+    // Allocate output buffer (always recreate to avoid stale handles)
+    if (output_buffer_) { clReleaseMemObject(output_buffer_); output_buffer_ = nullptr; }
+    {
+        cl_int buf_err = CL_SUCCESS;
+        output_buffer_ = clCreateBuffer(context, CL_MEM_READ_WRITE, output_size, nullptr, &buf_err);
+        if (buf_err != CL_SUCCESS || !output_buffer_) {
+            std::stringstream ss; ss << "Failed to create linear layer output buffer (step), err=" << buf_err
+            << ", size=" << output_size;
+            throw std::runtime_error(ss.str());
         }
         output_buffer_size_ = output_size;
     }
@@ -302,18 +322,32 @@ cl_mem LinearLayer::step(cl_mem input, int batch_size, cl_command_queue queue) {
     // For each batch element, compute: output = weights @ input
     // Since we have multiple batch elements, we'll use matmul with m=batch_size
     
+    if (!program_ || !matmul_kernel_) {
+        buildKernels();
+    }
+    if (!input || !weights_buffer_ || !output_buffer_) {
+        std::stringstream ss; ss << "Invalid buffers in LinearLayer::step: "
+        << " input=" << (input?"ok":"null")
+        << " weights=" << (weights_buffer_?"ok":"null")
+        << " output=" << (output_buffer_?"ok":"null");
+        throw std::runtime_error(ss.str());
+    }
+    clFinish(queue);
     cl_int err;
     err = clSetKernelArg(matmul_kernel_, 0, sizeof(cl_mem), &input);
-    err |= clSetKernelArg(matmul_kernel_, 1, sizeof(cl_mem), &weights_buffer_);
-    err |= clSetKernelArg(matmul_kernel_, 2, sizeof(cl_mem), &output_buffer_);
-    err |= clSetKernelArg(matmul_kernel_, 3, sizeof(int), &batch_size);   // m
-    err |= clSetKernelArg(matmul_kernel_, 4, sizeof(int), &input_dim_);   // k
-    err |= clSetKernelArg(matmul_kernel_, 5, sizeof(int), &output_dim_);  // n
-    err |= clSetKernelArg(matmul_kernel_, 6, sizeof(int), &batch_size);   // batch_size (already accounted)
-    
-    if (err != CL_SUCCESS) {
-        throw std::runtime_error("Failed to set matmul kernel arguments");
-    }
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 0 (input) err=") + std::to_string(err)); }
+    err = clSetKernelArg(matmul_kernel_, 1, sizeof(cl_mem), &weights_buffer_);
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 1 (weights) err=") + std::to_string(err)); }
+    err = clSetKernelArg(matmul_kernel_, 2, sizeof(cl_mem), &output_buffer_);
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 2 (output) err=") + std::to_string(err)); }
+    err = clSetKernelArg(matmul_kernel_, 3, sizeof(int), &batch_size);   // m
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 3 (m) err=") + std::to_string(err)); }
+    err = clSetKernelArg(matmul_kernel_, 4, sizeof(int), &input_dim_);   // k
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 4 (k) err=") + std::to_string(err)); }
+    err = clSetKernelArg(matmul_kernel_, 5, sizeof(int), &output_dim_);  // n
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 5 (n) err=") + std::to_string(err)); }
+    err = clSetKernelArg(matmul_kernel_, 6, sizeof(int), &batch_size);   // batch_size (already accounted)
+    if (err != CL_SUCCESS) { throw std::runtime_error(std::string("Failed to set arg 6 (batch_size) err=") + std::to_string(err)); }
     
     size_t global_size[2] = {static_cast<size_t>(batch_size), static_cast<size_t>(output_dim_)};
     

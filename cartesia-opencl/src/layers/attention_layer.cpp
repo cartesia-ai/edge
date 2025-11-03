@@ -11,6 +11,19 @@
 
 namespace cartesia_opencl {
 
+namespace {
+// Safely update an OpenCL buffer stored in state with retain/release semantics
+inline void retainAndAssign(cl_mem& dst, cl_mem src) {
+    if (dst && dst != src) {
+        clReleaseMemObject(dst);
+    }
+    if (src) {
+        clRetainMemObject(src);
+    }
+    dst = src;
+}
+}
+
 AttentionLayer::AttentionLayer(
     OpenCLContextManager* ctx,
     int d_model,
@@ -66,6 +79,7 @@ AttentionLayer::AttentionLayer(
     , attn_output_flat_size_(0)
     , kernels_built_(false)
     , kernel_build_failed_(false)
+    , use_cpu_reshape_(false)
     , use_cpu_fallback_(false)
 {
     if (!ctx_) {
@@ -185,9 +199,10 @@ __kernel void split_qkv(
             std::cout << " ✓" << std::flush;
         }
         
-        // 2. Build reshape kernels
-        {
+        // 2. Build reshape kernels (allow CPU fallback if driver crashes)
+        try {
             const char* reshape_source = R"(
+// OpenCL supports up to 3D NDRange; loop over d_head inside the kernel
 __kernel void reshape_for_attention(
     __global const float* input,
     __global float* output,
@@ -197,24 +212,22 @@ __kernel void reshape_for_attention(
     const int d_head
 ) {
     const int batch_idx = get_global_id(0);
-    const int head_idx = get_global_id(1);
-    const int seq_idx = get_global_id(2);
-    const int head_dim_idx = get_global_id(3);
+    const int head_idx  = get_global_id(1);
+    const int seq_idx   = get_global_id(2);
+    if (batch_idx >= batch_size || head_idx >= n_heads || seq_idx >= seq_len) return;
     
-    if (batch_idx >= batch_size || head_idx >= n_heads || 
-        seq_idx >= seq_len || head_dim_idx >= d_head) return;
-    
-    int input_idx = batch_idx * seq_len * n_heads * d_head +
-                    seq_idx * n_heads * d_head +
-                    head_idx * d_head +
-                    head_dim_idx;
-    
-    int output_idx = batch_idx * n_heads * seq_len * d_head +
-                     head_idx * seq_len * d_head +
-                     seq_idx * d_head +
-                     head_dim_idx;
-    
-    output[output_idx] = input[input_idx];
+    // Loop over head dimension
+    for (int d = 0; d < d_head; ++d) {
+        int input_idx = batch_idx * seq_len * n_heads * d_head +
+                        seq_idx * n_heads * d_head +
+                        head_idx * d_head +
+                        d;
+        int output_idx = batch_idx * n_heads * seq_len * d_head +
+                         head_idx * seq_len * d_head +
+                         seq_idx * d_head +
+                         d;
+        output[output_idx] = input[input_idx];
+    }
 }
 
 __kernel void reshape_from_attention(
@@ -226,24 +239,21 @@ __kernel void reshape_from_attention(
     const int d_head
 ) {
     const int batch_idx = get_global_id(0);
-    const int seq_idx = get_global_id(1);
-    const int head_idx = get_global_id(2);
-    const int head_dim_idx = get_global_id(3);
+    const int seq_idx   = get_global_id(1);
+    const int head_idx  = get_global_id(2);
+    if (batch_idx >= batch_size || seq_idx >= seq_len || head_idx >= n_heads) return;
     
-    if (batch_idx >= batch_size || seq_idx >= seq_len || 
-        head_idx >= n_heads || head_dim_idx >= d_head) return;
-    
-    int input_idx = batch_idx * n_heads * seq_len * d_head +
-                    head_idx * seq_len * d_head +
-                    seq_idx * d_head +
-                    head_dim_idx;
-    
-    int output_idx = batch_idx * seq_len * n_heads * d_head +
-                    seq_idx * n_heads * d_head +
-                    head_idx * d_head +
-                    head_dim_idx;
-    
-    output[output_idx] = input[input_idx];
+    for (int d = 0; d < d_head; ++d) {
+        int input_idx = batch_idx * n_heads * seq_len * d_head +
+                        head_idx * seq_len * d_head +
+                        seq_idx * d_head +
+                        d;
+        int output_idx = batch_idx * seq_len * n_heads * d_head +
+                         seq_idx * n_heads * d_head +
+                         head_idx * d_head +
+                         d;
+        output[output_idx] = input[input_idx];
+    }
 }
 )";
             std::cout << "\n      Building reshape program..." << std::flush;
@@ -254,6 +264,9 @@ __kernel void reshape_from_attention(
             reshape_kv_kernel_ = ctx_mgr.getKernel(reshape_program_, "reshape_for_attention");
             reshape_out_kernel_ = ctx_mgr.getKernel(reshape_program_, "reshape_from_attention");
             std::cout << " ✓" << std::flush;
+        } catch (const std::exception& e) {
+            std::cerr << "\n      WARNING: Reshape program build failed, using CPU reshape fallback: " << e.what() << std::endl;
+            use_cpu_reshape_ = true;
         }
         
         // 3. Build attention kernel (the complex one - simplified)
@@ -342,6 +355,7 @@ __kernel void scaled_dot_product_attention(
         // 4. Build concatenate kernel
         {
             const char* concat_source = R"(
+// Use 3D NDRange (batch, kv_heads, total_len) and loop over d_head in-kernel
 __kernel void concatenate_kv(
     __global const float* cached,
     __global const float* new_kv,
@@ -353,28 +367,26 @@ __kernel void concatenate_kv(
     const int d_head
 ) {
     const int batch_idx = get_global_id(0);
-    const int head_idx = get_global_id(1);
-    const int seq_idx = get_global_id(2);
-    const int d_idx = get_global_id(3);
-    
-    if (batch_idx >= batch_size || head_idx >= kv_heads || 
-        seq_idx >= cached_len + new_len || d_idx >= d_head) return;
+    const int head_idx  = get_global_id(1);
+    const int seq_idx   = get_global_id(2);
+    if (batch_idx >= batch_size || head_idx >= kv_heads || seq_idx >= (cached_len + new_len)) return;
     
     int total_len = cached_len + new_len;
-    int idx = batch_idx * kv_heads * total_len * d_head +
-              head_idx * total_len * d_head +
-              seq_idx * d_head + d_idx;
-    
-    if (seq_idx < cached_len) {
-        int cached_idx = batch_idx * kv_heads * cached_len * d_head +
-                        head_idx * cached_len * d_head +
-                        seq_idx * d_head + d_idx;
-        output[idx] = cached[cached_idx];
-    } else {
-        int new_idx = batch_idx * kv_heads * new_len * d_head +
-                     head_idx * new_len * d_head +
-                     (seq_idx - cached_len) * d_head + d_idx;
-        output[idx] = new_kv[new_idx];
+    for (int d = 0; d < d_head; ++d) {
+        int out_idx = batch_idx * kv_heads * total_len * d_head +
+                      head_idx * total_len * d_head +
+                      seq_idx * d_head + d;
+        if (seq_idx < cached_len) {
+            int cached_idx = batch_idx * kv_heads * cached_len * d_head +
+                             head_idx * cached_len * d_head +
+                             seq_idx * d_head + d;
+            output[out_idx] = cached[cached_idx];
+        } else {
+            int new_idx = batch_idx * kv_heads * new_len * d_head +
+                          head_idx * new_len * d_head +
+                          (seq_idx - cached_len) * d_head + d;
+            output[out_idx] = new_kv[new_idx];
+        }
     }
 }
 )";
@@ -468,6 +480,13 @@ cl_mem AttentionLayer::forward(
         throw std::runtime_error("Attention weights not initialized");
     }
     
+    // Optional runtime override to force CPU fallback regardless of kernel build state
+    if (const char* force_cpu = std::getenv("FORCE_ATTENTION_CPU")) {
+        if (std::string(force_cpu) == "1") {
+            return forwardCPU(input, batch_size, seq_len, state, queue);
+        }
+    }
+
     // Try to ensure kernels are built (lazy initialization)
     // If build fails, use CPU fallback
     try {
@@ -578,34 +597,37 @@ cl_mem AttentionLayer::forward(
         values_reshaped_size_ = kv_reshaped_size;
     }
     
-    // Reshape queries
-    err = clSetKernelArg(reshape_q_kernel_, 0, sizeof(cl_mem), &queries_);
-    err |= clSetKernelArg(reshape_q_kernel_, 1, sizeof(cl_mem), &queries_reshaped_);
-    err |= clSetKernelArg(reshape_q_kernel_, 2, sizeof(int), &batch_size);
-    err |= clSetKernelArg(reshape_q_kernel_, 3, sizeof(int), &seq_len);
-    err |= clSetKernelArg(reshape_q_kernel_, 4, sizeof(int), &n_heads_);
-    err |= clSetKernelArg(reshape_q_kernel_, 5, sizeof(int), &d_head_);
-    size_t reshape_global[4] = {static_cast<size_t>(batch_size), static_cast<size_t>(n_heads_), 
-                                 static_cast<size_t>(seq_len), static_cast<size_t>(d_head_)};
-    err = clEnqueueNDRangeKernel(queue, reshape_q_kernel_, 4, nullptr, reshape_global, nullptr, 0, nullptr, nullptr);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to reshape queries");
-    
-    // Reshape keys and values (same kernel, different buffers)
-    err = clSetKernelArg(reshape_kv_kernel_, 0, sizeof(cl_mem), &keys_);
-    err |= clSetKernelArg(reshape_kv_kernel_, 1, sizeof(cl_mem), &keys_reshaped_);
-    err |= clSetKernelArg(reshape_kv_kernel_, 2, sizeof(int), &batch_size);
-    err |= clSetKernelArg(reshape_kv_kernel_, 3, sizeof(int), &seq_len);
-    err |= clSetKernelArg(reshape_kv_kernel_, 4, sizeof(int), &kv_heads_);
-    err |= clSetKernelArg(reshape_kv_kernel_, 5, sizeof(int), &d_head_);
-    size_t reshape_kv_global[4] = {static_cast<size_t>(batch_size), static_cast<size_t>(kv_heads_),
-                                   static_cast<size_t>(seq_len), static_cast<size_t>(d_head_)};
-    err = clEnqueueNDRangeKernel(queue, reshape_kv_kernel_, 4, nullptr, reshape_kv_global, nullptr, 0, nullptr, nullptr);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to reshape keys");
-    
-    err = clSetKernelArg(reshape_kv_kernel_, 0, sizeof(cl_mem), &values_);
-    err |= clSetKernelArg(reshape_kv_kernel_, 1, sizeof(cl_mem), &values_reshaped_);
-    err = clEnqueueNDRangeKernel(queue, reshape_kv_kernel_, 4, nullptr, reshape_kv_global, nullptr, 0, nullptr, nullptr);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to reshape values");
+    if (use_cpu_reshape_) {
+        cpuReshapeQueries(batch_size, seq_len, queue);
+        cpuReshapeKV(batch_size, seq_len, queue);
+    } else {
+        // Reshape queries
+        err = clSetKernelArg(reshape_q_kernel_, 0, sizeof(cl_mem), &queries_);
+        err |= clSetKernelArg(reshape_q_kernel_, 1, sizeof(cl_mem), &queries_reshaped_);
+        err |= clSetKernelArg(reshape_q_kernel_, 2, sizeof(int), &batch_size);
+        err |= clSetKernelArg(reshape_q_kernel_, 3, sizeof(int), &seq_len);
+        err |= clSetKernelArg(reshape_q_kernel_, 4, sizeof(int), &n_heads_);
+        err |= clSetKernelArg(reshape_q_kernel_, 5, sizeof(int), &d_head_);
+        size_t reshape_global[3] = {static_cast<size_t>(batch_size), static_cast<size_t>(n_heads_), static_cast<size_t>(seq_len)};
+        err = clEnqueueNDRangeKernel(queue, reshape_q_kernel_, 3, nullptr, reshape_global, nullptr, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) throw std::runtime_error("Failed to reshape queries");
+        
+        // Reshape keys and values (same kernel, different buffers)
+        err = clSetKernelArg(reshape_kv_kernel_, 0, sizeof(cl_mem), &keys_);
+        err |= clSetKernelArg(reshape_kv_kernel_, 1, sizeof(cl_mem), &keys_reshaped_);
+        err |= clSetKernelArg(reshape_kv_kernel_, 2, sizeof(int), &batch_size);
+        err |= clSetKernelArg(reshape_kv_kernel_, 3, sizeof(int), &seq_len);
+        err |= clSetKernelArg(reshape_kv_kernel_, 4, sizeof(int), &kv_heads_);
+        err |= clSetKernelArg(reshape_kv_kernel_, 5, sizeof(int), &d_head_);
+        size_t reshape_kv_global[3] = {static_cast<size_t>(batch_size), static_cast<size_t>(kv_heads_), static_cast<size_t>(seq_len)};
+        err = clEnqueueNDRangeKernel(queue, reshape_kv_kernel_, 3, nullptr, reshape_kv_global, nullptr, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) throw std::runtime_error("Failed to reshape keys");
+        
+        err = clSetKernelArg(reshape_kv_kernel_, 0, sizeof(cl_mem), &values_);
+        err |= clSetKernelArg(reshape_kv_kernel_, 1, sizeof(cl_mem), &values_reshaped_);
+        err = clEnqueueNDRangeKernel(queue, reshape_kv_kernel_, 3, nullptr, reshape_kv_global, nullptr, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) throw std::runtime_error("Failed to reshape values");
+    }
     
     // Handle state concatenation if needed
     cl_mem final_keys = keys_reshaped_;
@@ -614,19 +636,21 @@ cl_mem AttentionLayer::forward(
     
     if (state && !state->is_null() && state->state1 && state->state2) {
         // Concatenate cached keys/values
-        if (!keys_concat_ || keys_concat_size_ < kv_reshaped_size * 2) {
+        int cached_len = cached_kv_len_ > 0 ? cached_kv_len_ : seq_len;
+        int total_len = cached_len + seq_len;
+        size_t concat_bytes = (size_t)batch_size * kv_heads_ * total_len * d_head_ * sizeof(float);
+        if (!keys_concat_ || keys_concat_size_ < concat_bytes) {
             if (keys_concat_) clReleaseMemObject(keys_concat_);
-            keys_concat_ = clCreateBuffer(context, CL_MEM_READ_WRITE, kv_reshaped_size * 2, nullptr, &err);
-            keys_concat_size_ = kv_reshaped_size * 2;
-            values_concat_size_ = kv_reshaped_size * 2;
+            keys_concat_ = clCreateBuffer(context, CL_MEM_READ_WRITE, concat_bytes, nullptr, &err);
+            if (err != CL_SUCCESS) throw std::runtime_error("Failed to create keys_concat buffer");
+            keys_concat_size_ = concat_bytes;
         }
-        if (!values_concat_) {
-            values_concat_ = clCreateBuffer(context, CL_MEM_READ_WRITE, kv_reshaped_size * 2, nullptr, &err);
+        if (!values_concat_ || values_concat_size_ < concat_bytes) {
+            if (values_concat_) clReleaseMemObject(values_concat_);
+            values_concat_ = clCreateBuffer(context, CL_MEM_READ_WRITE, concat_bytes, nullptr, &err);
+            if (err != CL_SUCCESS) throw std::runtime_error("Failed to create values_concat buffer");
+            values_concat_size_ = concat_bytes;
         }
-        
-        // Get cached lengths from state (simplified - assume we track this)
-        // For now, assume same length
-        int cached_len = seq_len;  // TODO: track actual cached length
         err = clSetKernelArg(concatenate_kv_kernel_, 0, sizeof(cl_mem), &state->state1);
         err |= clSetKernelArg(concatenate_kv_kernel_, 1, sizeof(cl_mem), &keys_reshaped_);
         err |= clSetKernelArg(concatenate_kv_kernel_, 2, sizeof(cl_mem), &keys_concat_);
@@ -635,31 +659,33 @@ cl_mem AttentionLayer::forward(
         err |= clSetKernelArg(concatenate_kv_kernel_, 5, sizeof(int), &cached_len);
         err |= clSetKernelArg(concatenate_kv_kernel_, 6, sizeof(int), &seq_len);
         err |= clSetKernelArg(concatenate_kv_kernel_, 7, sizeof(int), &d_head_);
-        size_t concat_global[4] = {static_cast<size_t>(batch_size), static_cast<size_t>(kv_heads_),
-                                   static_cast<size_t>(cached_len + seq_len), static_cast<size_t>(d_head_)};
-        err = clEnqueueNDRangeKernel(queue, concatenate_kv_kernel_, 4, nullptr, concat_global, nullptr, 0, nullptr, nullptr);
+        size_t concat_global[3] = {static_cast<size_t>(batch_size), static_cast<size_t>(kv_heads_),
+                                   static_cast<size_t>(total_len)};
+        err = clEnqueueNDRangeKernel(queue, concatenate_kv_kernel_, 3, nullptr, concat_global, nullptr, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) throw std::runtime_error("Failed to concatenate keys");
         
         // Same for values
         err = clSetKernelArg(concatenate_kv_kernel_, 0, sizeof(cl_mem), &state->state2);
         err |= clSetKernelArg(concatenate_kv_kernel_, 1, sizeof(cl_mem), &values_reshaped_);
         err |= clSetKernelArg(concatenate_kv_kernel_, 2, sizeof(cl_mem), &values_concat_);
-        err = clEnqueueNDRangeKernel(queue, concatenate_kv_kernel_, 4, nullptr, concat_global, nullptr, 0, nullptr, nullptr);
+        err = clEnqueueNDRangeKernel(queue, concatenate_kv_kernel_, 3, nullptr, concat_global, nullptr, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) throw std::runtime_error("Failed to concatenate values");
         
         final_keys = keys_concat_;
         final_values = values_concat_;
-        seq_len_kv = cached_len + seq_len;
+        seq_len_kv = total_len;
         
-        // Update state
-        state->state1 = final_keys;
-        state->state2 = final_values;
+        // Update state with proper retain/release to keep buffers alive across steps
+        retainAndAssign(state->state1, final_keys);
+        retainAndAssign(state->state2, final_values);
+        cached_kv_len_ = total_len;
     } else {
         // Initialize state
         if (state) {
-            state->state1 = keys_reshaped_;
-            state->state2 = values_reshaped_;
-            state->state3 = nullptr;
+            retainAndAssign(state->state1, keys_reshaped_);
+            retainAndAssign(state->state2, values_reshaped_);
+            // state3 unused for now
+            cached_kv_len_ = seq_len;
         }
     }
     
@@ -685,14 +711,36 @@ cl_mem AttentionLayer::forward(
     if (err != CL_SUCCESS) throw std::runtime_error("Failed to enqueue attention kernel");
     
     // Step 5: Reshape output back
-    err = clSetKernelArg(reshape_out_kernel_, 0, sizeof(cl_mem), &attn_output_);
-    err |= clSetKernelArg(reshape_out_kernel_, 1, sizeof(cl_mem), &attn_output_flat_);
-    err |= clSetKernelArg(reshape_out_kernel_, 2, sizeof(int), &batch_size);
-    err |= clSetKernelArg(reshape_out_kernel_, 3, sizeof(int), &seq_len);
-    err |= clSetKernelArg(reshape_out_kernel_, 4, sizeof(int), &n_heads_);
-    err |= clSetKernelArg(reshape_out_kernel_, 5, sizeof(int), &d_head_);
-    err = clEnqueueNDRangeKernel(queue, reshape_out_kernel_, 4, nullptr, reshape_global, nullptr, 0, nullptr, nullptr);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to reshape output");
+    if (use_cpu_reshape_) {
+        // CPU reshape back to flat
+        size_t attn_size = static_cast<size_t>(batch_size) * n_heads_ * seq_len * d_head_;
+        std::vector<float> attn_cpu(attn_size);
+        clEnqueueReadBuffer(queue, attn_output_, CL_TRUE, 0, attn_size * sizeof(float), attn_cpu.data(), 0, nullptr, nullptr);
+        std::vector<float> flat_cpu(static_cast<size_t>(batch_size) * seq_len * n_heads_ * d_head_);
+        for (int b = 0; b < batch_size; ++b) {
+            for (int h = 0; h < n_heads_; ++h) {
+                for (int s = 0; s < seq_len; ++s) {
+                    for (int d = 0; d < d_head_; ++d) {
+                        size_t in_idx = ((size_t)b*n_heads_*seq_len + h*seq_len + s)*d_head_ + d;
+                        size_t out_idx = ((size_t)b*seq_len + s)* (n_heads_*d_head_) + h*d_head_ + d;
+                        flat_cpu[out_idx] = attn_cpu[in_idx];
+                    }
+                }
+            }
+        }
+        clEnqueueWriteBuffer(queue, attn_output_flat_, CL_TRUE, 0, flat_cpu.size()*sizeof(float), flat_cpu.data(), 0, nullptr, nullptr);
+    } else {
+        err = clSetKernelArg(reshape_out_kernel_, 0, sizeof(cl_mem), &attn_output_);
+        err |= clSetKernelArg(reshape_out_kernel_, 1, sizeof(cl_mem), &attn_output_flat_);
+        err |= clSetKernelArg(reshape_out_kernel_, 2, sizeof(int), &batch_size);
+        err |= clSetKernelArg(reshape_out_kernel_, 3, sizeof(int), &seq_len);
+        err |= clSetKernelArg(reshape_out_kernel_, 4, sizeof(int), &n_heads_);
+        err |= clSetKernelArg(reshape_out_kernel_, 5, sizeof(int), &d_head_);
+        // Kernel is 3D (batch, seq_len, n_heads); it loops over d_head internally
+        size_t reshape_out_global[3] = {static_cast<size_t>(batch_size), static_cast<size_t>(seq_len), static_cast<size_t>(n_heads_)};
+        err = clEnqueueNDRangeKernel(queue, reshape_out_kernel_, 3, nullptr, reshape_out_global, nullptr, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) throw std::runtime_error("Failed to reshape output");
+    }
     
     // Step 6: Output projection
     cl_mem output = out_layer_->forward(attn_output_flat_, batch_size, seq_len, queue);
@@ -700,6 +748,47 @@ cl_mem AttentionLayer::forward(
     return output;
 }
 
+void AttentionLayer::cpuReshapeQueries(int batch_size, int seq_len, cl_command_queue queue) {
+    size_t flat_q = static_cast<size_t>(batch_size) * seq_len * n_heads_ * d_head_;
+    std::vector<float> q_flat(flat_q);
+    clEnqueueReadBuffer(queue, queries_, CL_TRUE, 0, flat_q*sizeof(float), q_flat.data(), 0, nullptr, nullptr);
+    std::vector<float> q_reshaped(static_cast<size_t>(batch_size)*n_heads_*seq_len*d_head_);
+    for (int b=0;b<batch_size;++b){
+        for (int s=0;s<seq_len;++s){
+            for (int h=0;h<n_heads_;++h){
+                for (int d=0;d<d_head_;++d){
+                    size_t in_idx = ((size_t)b*seq_len + s) * (n_heads_*d_head_) + h*d_head_ + d;
+                    size_t out_idx = ((size_t)b*n_heads_ + h) * (seq_len*d_head_) + s*d_head_ + d;
+                    q_reshaped[out_idx] = q_flat[in_idx];
+                }
+            }
+        }
+    }
+    clEnqueueWriteBuffer(queue, queries_reshaped_, CL_TRUE, 0, q_reshaped.size()*sizeof(float), q_reshaped.data(), 0, nullptr, nullptr);
+}
+
+void AttentionLayer::cpuReshapeKV(int batch_size, int seq_len, cl_command_queue queue) {
+    size_t flat_kv = static_cast<size_t>(batch_size) * seq_len * kv_heads_ * d_head_;
+    std::vector<float> k_flat(flat_kv), v_flat(flat_kv);
+    clEnqueueReadBuffer(queue, keys_, CL_TRUE, 0, flat_kv*sizeof(float), k_flat.data(), 0, nullptr, nullptr);
+    clEnqueueReadBuffer(queue, values_, CL_TRUE, 0, flat_kv*sizeof(float), v_flat.data(), 0, nullptr, nullptr);
+    std::vector<float> k_reshaped(static_cast<size_t>(batch_size)*kv_heads_*seq_len*d_head_);
+    std::vector<float> v_reshaped(k_reshaped.size());
+    for (int b=0;b<batch_size;++b){
+        for (int s=0;s<seq_len;++s){
+            for (int h=0;h<kv_heads_;++h){
+                for (int d=0;d<d_head_;++d){
+                    size_t in_idx = ((size_t)b*seq_len + s) * (kv_heads_*d_head_) + h*d_head_ + d;
+                    size_t out_idx = ((size_t)b*kv_heads_ + h) * (seq_len*d_head_) + s*d_head_ + d;
+                    k_reshaped[out_idx] = k_flat[in_idx];
+                    v_reshaped[out_idx] = v_flat[in_idx];
+                }
+            }
+        }
+    }
+    clEnqueueWriteBuffer(queue, keys_reshaped_, CL_TRUE, 0, k_reshaped.size()*sizeof(float), k_reshaped.data(), 0, nullptr, nullptr);
+    clEnqueueWriteBuffer(queue, values_reshaped_, CL_TRUE, 0, v_reshaped.size()*sizeof(float), v_reshaped.data(), 0, nullptr, nullptr);
+}
 cl_mem AttentionLayer::step(
     cl_mem input,
     int batch_size,
@@ -710,6 +799,13 @@ cl_mem AttentionLayer::step(
         throw std::runtime_error("Attention weights not initialized");
     }
     
+    // Optional runtime override to force CPU fallback regardless of kernel build state
+    if (const char* force_cpu = std::getenv("FORCE_ATTENTION_CPU")) {
+        if (std::string(force_cpu) == "1") {
+            return stepCPU(input, batch_size, state, queue);
+        }
+    }
+
     // Try to ensure kernels are built, use CPU fallback if failed
     try {
         ensureKernelsBuilt();
@@ -798,33 +894,59 @@ cl_mem AttentionLayer::step(
     err |= clSetKernelArg(split_qkv_kernel_, 6, sizeof(int), &n_heads_);
     err |= clSetKernelArg(split_qkv_kernel_, 7, sizeof(int), &kv_heads_);
     err |= clSetKernelArg(split_qkv_kernel_, 8, sizeof(int), &d_head_);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to set split_qkv kernel args (err=" + std::to_string(err) + ")");
+    }
     size_t global_size[2] = {static_cast<size_t>(batch_size), static_cast<size_t>(seq_len)};
     err = clEnqueueNDRangeKernel(queue, split_qkv_kernel_, 2, nullptr, global_size, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to enqueue split_qkv kernel (err=" + std::to_string(err) + ")");
+    }
     
-    // Reshape
-    size_t reshape_global[4] = {static_cast<size_t>(batch_size), static_cast<size_t>(n_heads_), 
-                                 static_cast<size_t>(seq_len), static_cast<size_t>(d_head_)};
+    // Reshape queries
+    size_t reshape_global[3] = {static_cast<size_t>(batch_size), static_cast<size_t>(n_heads_), 
+                                 static_cast<size_t>(seq_len)};
     err = clSetKernelArg(reshape_q_kernel_, 0, sizeof(cl_mem), &queries_);
     err |= clSetKernelArg(reshape_q_kernel_, 1, sizeof(cl_mem), &queries_reshaped_);
     err |= clSetKernelArg(reshape_q_kernel_, 2, sizeof(int), &batch_size);
     err |= clSetKernelArg(reshape_q_kernel_, 3, sizeof(int), &seq_len);
     err |= clSetKernelArg(reshape_q_kernel_, 4, sizeof(int), &n_heads_);
     err |= clSetKernelArg(reshape_q_kernel_, 5, sizeof(int), &d_head_);
-    err = clEnqueueNDRangeKernel(queue, reshape_q_kernel_, 4, nullptr, reshape_global, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to set reshape_q kernel args (err=" + std::to_string(err) + ")");
+    }
+    err = clEnqueueNDRangeKernel(queue, reshape_q_kernel_, 3, nullptr, reshape_global, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to enqueue reshape_q kernel (err=" + std::to_string(err) + ")");
+    }
     
-    size_t reshape_kv_global[4] = {static_cast<size_t>(batch_size), static_cast<size_t>(kv_heads_),
-                                   static_cast<size_t>(seq_len), static_cast<size_t>(d_head_)};
+    // Reshape keys
+    size_t reshape_kv_global[3] = {static_cast<size_t>(batch_size), static_cast<size_t>(kv_heads_),
+                                   static_cast<size_t>(seq_len)};
     err = clSetKernelArg(reshape_kv_kernel_, 0, sizeof(cl_mem), &keys_);
     err |= clSetKernelArg(reshape_kv_kernel_, 1, sizeof(cl_mem), &keys_reshaped_);
     err |= clSetKernelArg(reshape_kv_kernel_, 2, sizeof(int), &batch_size);
     err |= clSetKernelArg(reshape_kv_kernel_, 3, sizeof(int), &seq_len);
     err |= clSetKernelArg(reshape_kv_kernel_, 4, sizeof(int), &kv_heads_);
     err |= clSetKernelArg(reshape_kv_kernel_, 5, sizeof(int), &d_head_);
-    err = clEnqueueNDRangeKernel(queue, reshape_kv_kernel_, 4, nullptr, reshape_kv_global, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to set reshape_kv kernel args for keys (err=" + std::to_string(err) + ")");
+    }
+    err = clEnqueueNDRangeKernel(queue, reshape_kv_kernel_, 3, nullptr, reshape_kv_global, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to enqueue reshape_kv kernel for keys (err=" + std::to_string(err) + ")");
+    }
     
+    // Reshape values
     err = clSetKernelArg(reshape_kv_kernel_, 0, sizeof(cl_mem), &values_);
     err |= clSetKernelArg(reshape_kv_kernel_, 1, sizeof(cl_mem), &values_reshaped_);
-    err = clEnqueueNDRangeKernel(queue, reshape_kv_kernel_, 4, nullptr, reshape_kv_global, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to set reshape_kv kernel args for values (err=" + std::to_string(err) + ")");
+    }
+    err = clEnqueueNDRangeKernel(queue, reshape_kv_kernel_, 3, nullptr, reshape_kv_global, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to enqueue reshape_kv kernel for values (err=" + std::to_string(err) + ")");
+    }
     
     // Handle state - concatenate with cached keys/values
     cl_mem final_keys = keys_reshaped_;
@@ -832,22 +954,34 @@ cl_mem AttentionLayer::step(
     int seq_len_kv = seq_len;
     
     if (state && !state->is_null() && state->state1 && state->state2) {
-        // Concatenate - get cached length from state
-        // TODO: track actual cached length properly (for now, assume it's valid)
-        // The cached keys/values in state should have shape [batch, kv_heads, cached_len, d_head]
-        // For simplicity, we'll use a reasonable default or track it separately
-        int cached_len = seq_len;  // Placeholder - should track actual length
+        // Concatenate with proper cached length tracking
+        int cached_len = cached_kv_len_ > 0 ? cached_kv_len_ : 1;
+        int total_len = cached_len + seq_len;
+        size_t concat_bytes = (size_t)batch_size * kv_heads_ * total_len * d_head_ * sizeof(float);
         
-        if (!keys_concat_ || keys_concat_size_ < kv_reshaped_size * 2) {
+        // Validate state buffers before using them
+        if (!state->state1 || !state->state2) {
+            throw std::runtime_error("Attention step: state buffers are null");
+        }
+        
+        if (!keys_concat_ || keys_concat_size_ < concat_bytes) {
             if (keys_concat_) clReleaseMemObject(keys_concat_);
-            keys_concat_ = clCreateBuffer(context, CL_MEM_READ_WRITE, kv_reshaped_size * 2, nullptr, &err);
-            keys_concat_size_ = kv_reshaped_size * 2;
+            keys_concat_ = clCreateBuffer(context, CL_MEM_READ_WRITE, concat_bytes, nullptr, &err);
+            if (err != CL_SUCCESS || !keys_concat_) {
+                throw std::runtime_error("Failed to create keys_concat buffer (err=" + std::to_string(err) + ", size=" + std::to_string(concat_bytes) + ")");
+            }
+            keys_concat_size_ = concat_bytes;
         }
-        if (!values_concat_) {
-            values_concat_ = clCreateBuffer(context, CL_MEM_READ_WRITE, kv_reshaped_size * 2, nullptr, &err);
-            values_concat_size_ = kv_reshaped_size * 2;
+        if (!values_concat_ || values_concat_size_ < concat_bytes) {
+            if (values_concat_) clReleaseMemObject(values_concat_);
+            values_concat_ = clCreateBuffer(context, CL_MEM_READ_WRITE, concat_bytes, nullptr, &err);
+            if (err != CL_SUCCESS || !values_concat_) {
+                throw std::runtime_error("Failed to create values_concat buffer (err=" + std::to_string(err) + ", size=" + std::to_string(concat_bytes) + ")");
+            }
+            values_concat_size_ = concat_bytes;
         }
         
+        // Concatenate keys: [cached] + [new] -> [concat]
         err = clSetKernelArg(concatenate_kv_kernel_, 0, sizeof(cl_mem), &state->state1);
         err |= clSetKernelArg(concatenate_kv_kernel_, 1, sizeof(cl_mem), &keys_reshaped_);
         err |= clSetKernelArg(concatenate_kv_kernel_, 2, sizeof(cl_mem), &keys_concat_);
@@ -856,28 +990,43 @@ cl_mem AttentionLayer::step(
         err |= clSetKernelArg(concatenate_kv_kernel_, 5, sizeof(int), &cached_len);
         err |= clSetKernelArg(concatenate_kv_kernel_, 6, sizeof(int), &seq_len);
         err |= clSetKernelArg(concatenate_kv_kernel_, 7, sizeof(int), &d_head_);
-        size_t concat_global[4] = {static_cast<size_t>(batch_size), static_cast<size_t>(kv_heads_),
-                                   static_cast<size_t>(cached_len + seq_len), static_cast<size_t>(d_head_)};
-        err = clEnqueueNDRangeKernel(queue, concatenate_kv_kernel_, 4, nullptr, concat_global, nullptr, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            throw std::runtime_error("Failed to set concatenate_kv kernel args for keys (err=" + std::to_string(err) + ")");
+        }
+        size_t concat_global[3] = {static_cast<size_t>(batch_size), static_cast<size_t>(kv_heads_),
+                                   static_cast<size_t>(total_len)};
+        err = clEnqueueNDRangeKernel(queue, concatenate_kv_kernel_, 3, nullptr, concat_global, nullptr, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            throw std::runtime_error("Failed to enqueue concatenate_kv kernel for keys (err=" + std::to_string(err) + ", cached_len=" + std::to_string(cached_len) + ", seq_len=" + std::to_string(seq_len) + ", total_len=" + std::to_string(total_len) + ")");
+        }
         
+        // Concatenate values: [cached] + [new] -> [concat]
         err = clSetKernelArg(concatenate_kv_kernel_, 0, sizeof(cl_mem), &state->state2);
         err |= clSetKernelArg(concatenate_kv_kernel_, 1, sizeof(cl_mem), &values_reshaped_);
         err |= clSetKernelArg(concatenate_kv_kernel_, 2, sizeof(cl_mem), &values_concat_);
-        err = clEnqueueNDRangeKernel(queue, concatenate_kv_kernel_, 4, nullptr, concat_global, nullptr, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            throw std::runtime_error("Failed to set concatenate_kv kernel args for values (err=" + std::to_string(err) + ")");
+        }
+        err = clEnqueueNDRangeKernel(queue, concatenate_kv_kernel_, 3, nullptr, concat_global, nullptr, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            throw std::runtime_error("Failed to enqueue concatenate_kv kernel for values (err=" + std::to_string(err) + ")");
+        }
         
         final_keys = keys_concat_;
         final_values = values_concat_;
-        seq_len_kv = cached_len + seq_len;
+        seq_len_kv = total_len;
         
-        // Update state
-        state->state1 = final_keys;
-        state->state2 = final_values;
+        // Update state with proper retain/release
+        retainAndAssign(state->state1, final_keys);
+        retainAndAssign(state->state2, final_values);
+        cached_kv_len_ = total_len;
     } else {
         // Initialize state
         if (state) {
-            state->state1 = keys_reshaped_;
-            state->state2 = values_reshaped_;
-            state->state3 = nullptr;
+            retainAndAssign(state->state1, keys_reshaped_);
+            retainAndAssign(state->state2, values_reshaped_);
+            // state3 unused for now
+            cached_kv_len_ = seq_len;
         }
     }
     
@@ -895,9 +1044,15 @@ cl_mem AttentionLayer::step(
     err |= clSetKernelArg(attention_kernel_, 10, sizeof(int), &d_head_);
     int causal_int = causal_ ? 1 : 0;
     err |= clSetKernelArg(attention_kernel_, 11, sizeof(int), &causal_int);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to set attention kernel args (err=" + std::to_string(err) + ", seq_len_kv=" + std::to_string(seq_len_kv) + ")");
+    }
     size_t attn_global[3] = {static_cast<size_t>(batch_size), static_cast<size_t>(n_heads_), 
                             static_cast<size_t>(seq_len)};
     err = clEnqueueNDRangeKernel(queue, attention_kernel_, 3, nullptr, attn_global, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to enqueue attention kernel (err=" + std::to_string(err) + ", seq_len=" + std::to_string(seq_len) + ", seq_len_kv=" + std::to_string(seq_len_kv) + ")");
+    }
     
     // Reshape output
     err = clSetKernelArg(reshape_out_kernel_, 0, sizeof(cl_mem), &attn_output_);
@@ -906,7 +1061,13 @@ cl_mem AttentionLayer::step(
     err |= clSetKernelArg(reshape_out_kernel_, 3, sizeof(int), &seq_len);
     err |= clSetKernelArg(reshape_out_kernel_, 4, sizeof(int), &n_heads_);
     err |= clSetKernelArg(reshape_out_kernel_, 5, sizeof(int), &d_head_);
-    err = clEnqueueNDRangeKernel(queue, reshape_out_kernel_, 4, nullptr, reshape_global, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to set reshape_out kernel args (err=" + std::to_string(err) + ")");
+    }
+    err = clEnqueueNDRangeKernel(queue, reshape_out_kernel_, 3, nullptr, reshape_global, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to enqueue reshape_out kernel (err=" + std::to_string(err) + ")");
+    }
     
     // Output projection
     cl_mem output = out_layer_->step(attn_output_flat_, batch_size, queue);

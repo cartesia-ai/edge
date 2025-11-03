@@ -65,6 +65,19 @@ void OpenCLContextManager::initializeOpenCL() {
         clReleaseContext(context_);
         throw std::runtime_error("Failed to create command queue: " + std::to_string(err));
     }
+
+    // Print device info for diagnostics
+    char platform_name[256] = {0};
+    char device_name[256] = {0};
+    char device_vendor[256] = {0};
+    char driver_version[256] = {0};
+    clGetPlatformInfo(platform_, CL_PLATFORM_NAME, sizeof(platform_name), platform_name, nullptr);
+    clGetDeviceInfo(device_, CL_DEVICE_NAME, sizeof(device_name), device_name, nullptr);
+    clGetDeviceInfo(device_, CL_DEVICE_VENDOR, sizeof(device_vendor), device_vendor, nullptr);
+    clGetDeviceInfo(device_, CL_DRIVER_VERSION, sizeof(driver_version), driver_version, nullptr);
+    std::cout << "OpenCL Platform: " << platform_name << "\n"
+              << "OpenCL Device:   " << device_name << " (" << device_vendor << ")\n"
+              << "Driver Version:  " << driver_version << std::endl;
 }
 
 cl_program OpenCLContextManager::buildProgram(const std::vector<std::string>& sources, const std::string& cache_key) {
@@ -120,11 +133,21 @@ cl_program OpenCLContextManager::buildProgram(const std::vector<std::string>& so
         throw std::runtime_error("Failed to create OpenCL program: " + std::to_string(err));
     }
     
-    err = clBuildProgram(program, 1, &device_, nullptr, nullptr, nullptr);
+    // Build options: allow override via env, default to conservative settings
+    const char* env_opts = std::getenv("OPENCL_BUILD_OPTS");
+    std::string build_opts = env_opts ? std::string(env_opts) : std::string("-cl-std=CL1.2 -cl-opt-disable");
+    err = clBuildProgram(program, 1, &device_, build_opts.c_str(), nullptr, nullptr);
     if (err != CL_SUCCESS) {
         std::string build_log = getBuildLog(program);
         clReleaseProgram(program);
-        throw std::runtime_error("Failed to build OpenCL program: " + std::to_string(err) + "\n" + build_log);
+        throw std::runtime_error("Failed to build OpenCL program: " + std::to_string(err) + "\nBuild options: " + build_opts + "\n" + build_log);
+    }
+    // Optionally print build log on success when verbose requested
+    if (const char* verbose = std::getenv("OPENCL_BUILD_VERBOSE"); verbose && std::string(verbose) == "1") {
+        std::string log = getBuildLog(program);
+        if (!log.empty()) {
+            std::cout << "[OpenCL] Build log (success):\n" << log << std::endl;
+        }
     }
     
     // Save to cache if cache_key is provided

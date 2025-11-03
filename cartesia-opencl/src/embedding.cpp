@@ -87,11 +87,15 @@ cl_mem EmbeddingLayer::encode(cl_mem token_ids, int batch_size, int seq_len, cl_
     size_t output_size = batch_size * seq_len * d_model_ * sizeof(float);
     
     // Allocate or resize output buffer
-    if (!output_buffer_ || output_buffer_size_ < output_size) {
+    if (!output_buffer_ || output_buffer_size_ != output_size) {
         if (output_buffer_) clReleaseMemObject(output_buffer_);
         
-        output_buffer_ = clCreateBuffer(context, CL_MEM_WRITE_ONLY, output_size, nullptr, nullptr);
-        if (!output_buffer_) {
+        // Use READ_WRITE for broader driver compatibility
+        cl_int create_err = CL_SUCCESS;
+        output_buffer_ = clCreateBuffer(context, CL_MEM_READ_WRITE, output_size, nullptr, &create_err);
+        if (create_err != CL_SUCCESS || !output_buffer_) {
+            std::cerr << "\n[Embedding] Failed to create output buffer (encode) err=" << create_err
+                      << ", size=" << output_size << std::endl;
             throw std::runtime_error("Failed to create embedding output buffer");
         }
         output_buffer_size_ = output_size;
@@ -139,15 +143,35 @@ cl_mem EmbeddingLayer::encode(cl_mem token_ids, int batch_size, int seq_len, cl_
         }
     }
     
-    // Write back to GPU
-    err = clEnqueueWriteBuffer(
-        queue, output_buffer_, CL_TRUE, 0,
-        output_size, output_cpu.data(),
-        0, nullptr, nullptr
+    // Ensure prior commands are finished (some drivers require explicit sync)
+    clFinish(queue);
+
+    // Prefer map/unmap over WriteBuffer to avoid CL_INVALID_MEM_OBJECT quirks
+    void* mapped_ptr = clEnqueueMapBuffer(
+        queue, output_buffer_, CL_TRUE, CL_MAP_WRITE, 0, output_size,
+        0, nullptr, nullptr, &err
     );
-    if (err != CL_SUCCESS) {
-        throw std::runtime_error("Failed to write embedding output");
+    if (err != CL_SUCCESS || mapped_ptr == nullptr) {
+        // Provide detailed diagnostics
+        cl_device_id device = ctx_->getDevice();
+        cl_ulong max_alloc = 0, global_mem = 0;
+        clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(cl_ulong), &max_alloc, nullptr);
+        clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(cl_ulong), &global_mem, nullptr);
+        std::cerr << "\n[Embedding] Error mapping output buffer" << std::endl;
+        std::cerr << "  OpenCL err: " << err << std::endl;
+        std::cerr << "  output_size: " << output_size << " bytes" << std::endl;
+        std::cerr << "  output_buffer_size_: " << output_buffer_size_ << " bytes" << std::endl;
+        std::cerr << "  shape: (batch=" << batch_size << ", seq_len=" << seq_len << ", d_model=" << d_model_ << ")" << std::endl;
+        std::cerr << "  device max_alloc: " << (max_alloc / 1024 / 1024) << " MB, global: " << (global_mem / 1024 / 1024) << " MB" << std::endl;
+        throw std::runtime_error("Failed to map embedding output buffer");
     }
+    std::memcpy(mapped_ptr, output_cpu.data(), output_size);
+    err = clEnqueueUnmapMemObject(queue, output_buffer_, mapped_ptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        std::cerr << "\n[Embedding] Error unmapping output buffer, err=" << err << std::endl;
+        throw std::runtime_error("Failed to unmap embedding output buffer");
+    }
+    clFinish(queue);
     
     return output_buffer_;
 }
@@ -161,11 +185,17 @@ cl_mem EmbeddingLayer::encodeStep(cl_mem token_ids, int batch_size, cl_command_q
     size_t output_size = batch_size * d_model_ * sizeof(float);
     
     // Allocate or resize output buffer
-    if (!output_buffer_ || output_buffer_size_ < output_size) {
+    // For step, always recreate to avoid stale handles on some drivers
+    if (output_buffer_) { clReleaseMemObject(output_buffer_); output_buffer_ = nullptr; }
+    if (!output_buffer_ || output_buffer_size_ != output_size) {
         if (output_buffer_) clReleaseMemObject(output_buffer_);
         
-        output_buffer_ = clCreateBuffer(context, CL_MEM_WRITE_ONLY, output_size, nullptr, nullptr);
-        if (!output_buffer_) {
+        // Use READ_WRITE for broader driver compatibility
+        cl_int create_err = CL_SUCCESS;
+        output_buffer_ = clCreateBuffer(context, CL_MEM_READ_WRITE, output_size, nullptr, &create_err);
+        if (create_err != CL_SUCCESS || !output_buffer_) {
+            std::cerr << "\n[Embedding] Failed to create output buffer (step) err=" << create_err
+                      << ", size=" << output_size << std::endl;
             throw std::runtime_error("Failed to create embedding output buffer");
         }
         output_buffer_size_ = output_size;
@@ -206,14 +236,34 @@ cl_mem EmbeddingLayer::encodeStep(cl_mem token_ids, int batch_size, cl_command_q
         }
     }
     
-    err = clEnqueueWriteBuffer(
-        queue, output_buffer_, CL_TRUE, 0,
-        output_size, output_cpu.data(),
-        0, nullptr, nullptr
+    // Ensure prior commands are finished
+    clFinish(queue);
+
+    // Map/unmap path
+    void* mapped_ptr = clEnqueueMapBuffer(
+        queue, output_buffer_, CL_TRUE, CL_MAP_WRITE, 0, output_size,
+        0, nullptr, nullptr, &err
     );
-    if (err != CL_SUCCESS) {
-        throw std::runtime_error("Failed to write embedding output");
+    if (err != CL_SUCCESS || mapped_ptr == nullptr) {
+        cl_device_id device = ctx_->getDevice();
+        cl_ulong max_alloc = 0, global_mem = 0;
+        clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(cl_ulong), &max_alloc, nullptr);
+        clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(cl_ulong), &global_mem, nullptr);
+        std::cerr << "\n[Embedding] Error mapping output buffer (step)" << std::endl;
+        std::cerr << "  OpenCL err: " << err << std::endl;
+        std::cerr << "  output_size: " << output_size << " bytes" << std::endl;
+        std::cerr << "  output_buffer_size_: " << output_buffer_size_ << " bytes" << std::endl;
+        std::cerr << "  shape: (batch=" << batch_size << ", d_model=" << d_model_ << ")" << std::endl;
+        std::cerr << "  device max_alloc: " << (max_alloc / 1024 / 1024) << " MB, global: " << (global_mem / 1024 / 1024) << " MB" << std::endl;
+        throw std::runtime_error("Failed to map embedding output buffer");
     }
+    std::memcpy(mapped_ptr, output_cpu.data(), output_size);
+    err = clEnqueueUnmapMemObject(queue, output_buffer_, mapped_ptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        std::cerr << "\n[Embedding] Error unmapping output buffer (step), err=" << err << std::endl;
+        throw std::runtime_error("Failed to unmap embedding output buffer");
+    }
+    clFinish(queue);
     
     return output_buffer_;
 }

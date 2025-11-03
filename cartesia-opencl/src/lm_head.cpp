@@ -92,7 +92,8 @@ cl_mem LMHead::forward(cl_mem hidden_states, int batch_size, cl_command_queue qu
     if (!output_buffer_ || output_buffer_size_ < output_size) {
         if (output_buffer_) clReleaseMemObject(output_buffer_);
         
-        output_buffer_ = clCreateBuffer(context, CL_MEM_WRITE_ONLY, output_size, nullptr, nullptr);
+        // Use READ_WRITE so downstream code can read logits from this buffer
+        output_buffer_ = clCreateBuffer(context, CL_MEM_READ_WRITE, output_size, nullptr, nullptr);
         if (!output_buffer_) {
             throw std::runtime_error("Failed to create LM head output buffer");
         }
@@ -138,6 +139,9 @@ cl_mem LMHead::forward(cl_mem hidden_states, int batch_size, cl_command_queue qu
         }
     }
     
+    // Ensure queue is idle before writing logits back (improves stability on some drivers)
+    clFinish(queue);
+
     // Write back to GPU
     err = clEnqueueWriteBuffer(
         queue, output_buffer_, CL_TRUE, 0,
@@ -145,9 +149,13 @@ cl_mem LMHead::forward(cl_mem hidden_states, int batch_size, cl_command_queue qu
         0, nullptr, nullptr
     );
     if (err != CL_SUCCESS) {
-        throw std::runtime_error("Failed to write LM head output");
+        std::string err_msg = "Failed to write LM head output (err=" + std::to_string(err) + ")";
+        throw std::runtime_error(err_msg);
     }
     
+    // Increase ref count before returning so callers can safely clRelease
+    // without invalidating LMHead's internal buffer reference.
+    clRetainMemObject(output_buffer_);
     return output_buffer_;
 }
 

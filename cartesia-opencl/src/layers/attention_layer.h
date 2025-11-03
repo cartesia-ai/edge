@@ -117,9 +117,13 @@ private:
     cl_mem attn_output_flat_; // [batch_size, seq_len, n_heads * d_head]
     size_t attn_output_flat_size_;
 
+    // Tracking cached KV length across steps (in tokens)
+    int cached_kv_len_ = 0;
+
     // Kernel building
     bool kernels_built_;
     bool kernel_build_failed_;
+    bool use_cpu_reshape_;
     bool use_cpu_fallback_;  // Use CPU fallback if kernel build fails
     
     void buildKernels();
@@ -128,6 +132,10 @@ private:
     // CPU fallback methods (works with any dimensions, no compilation needed)
     cl_mem forwardCPU(cl_mem input, int batch_size, int seq_len, LayerState* state, cl_command_queue queue);
     cl_mem stepCPU(cl_mem input, int batch_size, LayerState* state, cl_command_queue queue);
+
+    // CPU reshape helpers
+    void cpuReshapeQueries(int batch_size, int seq_len, cl_command_queue queue);
+    void cpuReshapeKV(int batch_size, int seq_len, cl_command_queue queue);
 };
 
 } // namespace cartesia_opencl
