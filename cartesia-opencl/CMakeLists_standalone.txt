@@ -1,0 +1,169 @@
+cmake_minimum_required(VERSION 3.18)
+project(CartesiaOpenCL CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Find OpenCL - on Android, we need to look in system/vendor paths
+find_library(OpenCL_LIBRARY
+    NAMES OpenCL
+    PATHS
+        ${CMAKE_SYSROOT}/vendor/lib64
+        ${CMAKE_SYSROOT}/system/lib64
+        ${CMAKE_SYSROOT}/vendor/lib
+        ${CMAKE_SYSROOT}/system/lib
+    NO_DEFAULT_PATH
+)
+
+if(NOT OpenCL_LIBRARY)
+    message(WARNING "OpenCL library not found via find_library, using direct paths")
+    # Try direct paths
+    if(EXISTS "${CMAKE_SYSROOT}/vendor/lib64/libOpenCL.so")
+        set(OpenCL_LIBRARY "${CMAKE_SYSROOT}/vendor/lib64/libOpenCL.so")
+    elseif(EXISTS "${CMAKE_SYSROOT}/vendor/lib/libOpenCL.so")
+        set(OpenCL_LIBRARY "${CMAKE_SYSROOT}/vendor/lib/libOpenCL.so")
+    else()
+        # Fallback: will link at runtime
+        set(OpenCL_LIBRARY "OpenCL")
+    endif()
+endif()
+
+message(STATUS "Using OpenCL library: ${OpenCL_LIBRARY}")
+
+# OpenCL headers - check multiple locations
+# For cross-compilation, we need headers on the host system
+# OpenCL headers path - will be replaced by build script with absolute path
+# Note: OpenCL-Headers repo has headers in CL/ subdirectory, so the include dir is OpenCL-Headers itself
+set(OPENCL_HEADERS_BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/opencl-headers/OpenCL-Headers")
+
+# Add CMAKE_PREFIX_PATH to search paths (for Homebrew installations)
+# Homebrew suggests: export CMAKE_PREFIX_PATH="/usr/local/opt/opencl-headers"
+list(APPEND CMAKE_PREFIX_PATH
+    "/usr/local/opt/opencl-headers"
+    "/opt/homebrew/opt/opencl-headers"
+)
+
+# Search for OpenCL headers
+# For cross-compilation, directly check file existence rather than using find_path
+# which can be unreliable with NO_DEFAULT_PATH
+message(STATUS "Searching for OpenCL headers...")
+message(STATUS "  OPENCL_HEADERS_BASE_DIR: ${OPENCL_HEADERS_BASE_DIR}")
+message(STATUS "  CMAKE_PREFIX_PATH: ${CMAKE_PREFIX_PATH}")
+
+# Check each potential location directly
+set(OPENCL_HEADER_CANDIDATES
+    "${OPENCL_HEADERS_BASE_DIR}/CL/cl.h"
+    "/usr/local/opt/opencl-headers/include/CL/cl.h"
+    "/opt/homebrew/opt/opencl-headers/include/CL/cl.h"
+    "/opt/homebrew/include/CL/cl.h"
+    "/usr/local/include/CL/cl.h"
+    "/usr/include/CL/cl.h"
+)
+
+# Also check CMAKE_PREFIX_PATH entries
+foreach(prefix_path ${CMAKE_PREFIX_PATH})
+    list(APPEND OPENCL_HEADER_CANDIDATES "${prefix_path}/include/CL/cl.h")
+    list(APPEND OPENCL_HEADER_CANDIDATES "${prefix_path}/CL/cl.h")
+endforeach()
+
+# Find the first existing header file
+set(OpenCL_INCLUDE_DIR "")
+foreach(header_file ${OPENCL_HEADER_CANDIDATES})
+    if(EXISTS "${header_file}")
+        # Extract the directory containing CL/ (the include directory)
+        # If header is at /path/include/CL/cl.h, we want /path/include
+        # If header is at /path/CL/cl.h, we want /path
+        get_filename_component(header_dir "${header_file}" DIRECTORY)  # Gets .../CL
+        get_filename_component(include_dir "${header_dir}" DIRECTORY)   # Gets parent of CL
+        
+        # Check if we have /path/include/CL/cl.h or /path/CL/cl.h
+        get_filename_component(include_dir_name "${include_dir}" NAME)
+        if(include_dir_name STREQUAL "include")
+            # Header is at /path/include/CL/cl.h, use /path/include
+            set(OpenCL_INCLUDE_DIR "${include_dir}")
+        else()
+            # Header is at /path/CL/cl.h, use /path
+            set(OpenCL_INCLUDE_DIR "${include_dir}")
+        endif()
+        message(STATUS "  Found OpenCL headers at: ${OpenCL_INCLUDE_DIR} (checked ${header_file})")
+        break()
+    endif()
+endforeach()
+
+if(NOT OpenCL_INCLUDE_DIR)
+    message(FATAL_ERROR "OpenCL headers not found! Please install opencl-headers:\n  brew install opencl-headers\nOr download from: https://github.com/KhronosGroup/OpenCL-Headers")
+endif()
+
+message(STATUS "Found OpenCL headers: ${OpenCL_INCLUDE_DIR}")
+
+# Source files for Rene model
+add_executable(cartesia_opencl_test
+    main_rene.cpp
+    src/opencl_context.cpp
+    src/weights.cpp
+    src/sampling.cpp
+    src/embedding.cpp
+    src/lm_head.cpp
+    src/sequence_model.cpp
+    src/residual_block.cpp
+    src/layers/linear_layer.cpp
+    src/layers/rms_norm_layer.cpp
+    src/layers/swiglu_layer.cpp
+    src/layers/attention_layer.cpp
+    src/layers/ssd_layer.cpp
+)
+
+target_include_directories(cartesia_opencl_test PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${OpenCL_INCLUDE_DIR}
+)
+
+# For Android cross-compilation, we need to link against OpenCL but allow it to be found at runtime
+if(ANDROID)
+    # The library from device may have unsupported relocations, so we use a workaround:
+    # Link with --allow-shlib-undefined and let runtime linker find it via rpath
+    # This tells the linker to add libOpenCL.so to NEEDED list without actually resolving symbols
+    message(STATUS "Linking against OpenCL for Android (will resolve at runtime)")
+    
+    # Create/use a stub library for linking, then runtime will use real library
+    set(OPENCL_STUB_LIB "/tmp/libOpenCL_stub.so")
+    if(EXISTS "${OPENCL_STUB_LIB}")
+        message(STATUS "Using OpenCL stub library: ${OPENCL_STUB_LIB}")
+        # Link with stub library and allow undefined symbols to be resolved at runtime
+        target_link_options(cartesia_opencl_test PRIVATE 
+            "-Wl,--allow-shlib-undefined"
+            "-Wl,--unresolved-symbols=ignore-all"
+        )
+        target_link_libraries(cartesia_opencl_test "${OPENCL_STUB_LIB}")
+    else()
+        # Fallback: try linking with -lOpenCL and allow-undefined flags
+        message(STATUS "OpenCL stub not found, attempting direct link with flags")
+        target_link_options(cartesia_opencl_test PRIVATE 
+            "-Wl,--allow-shlib-undefined"
+            "-Wl,--unresolved-symbols=ignore-all"
+        )
+        target_link_libraries(cartesia_opencl_test OpenCL)
+    endif()
+    
+    # Set rpath to find OpenCL at runtime - vendor paths are checked first
+    target_link_options(cartesia_opencl_test PRIVATE 
+        "-Wl,-rpath,/vendor/lib64:/vendor/lib:/system/lib64:/system/lib"
+    )
+else()
+    # For native builds, use the found library
+    target_link_libraries(cartesia_opencl_test ${OpenCL_LIBRARY})
+endif()
+
+# Set rpath to find OpenCL at runtime on Android
+set_target_properties(cartesia_opencl_test PROPERTIES
+    INSTALL_RPATH "/vendor/lib64:/vendor/lib:/system/lib64:/system/lib"
+)
+
+# For Android, we may need to link against log library
+if(ANDROID)
+    find_library(log-lib log)
+    if(log-lib)
+        target_link_libraries(cartesia_opencl_test ${log-lib})
+    endif()
+endif()
+

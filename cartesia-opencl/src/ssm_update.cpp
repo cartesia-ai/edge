@@ -19,7 +19,15 @@ private:
     cl_kernel ssm_update_kernel_fp16_;
 
 public:
-    OpenCLContext() {
+    OpenCLContext() 
+        : platform_(nullptr)
+        , device_(nullptr)
+        , context_(nullptr)
+        , queue_(nullptr)
+        , program_(nullptr)
+        , ssm_update_kernel_fp32_(nullptr)
+        , ssm_update_kernel_fp16_(nullptr)
+    {
         initializeOpenCL();
         buildProgram();
         createKernels();
@@ -124,8 +132,16 @@ private:
         }
 
         // Create context and command queue
-        context_ = clCreateContext(nullptr, 1, &device_, nullptr, nullptr, nullptr);
-        queue_ = clCreateCommandQueue(context_, device_, 0, nullptr);
+        cl_int err;
+        context_ = clCreateContext(nullptr, 1, &device_, nullptr, nullptr, &err);
+        if (err != CL_SUCCESS || !context_) {
+            throw std::runtime_error("Failed to create OpenCL context: " + std::to_string(err));
+        }
+        queue_ = clCreateCommandQueue(context_, device_, 0, &err);
+        if (err != CL_SUCCESS || !queue_) {
+            clReleaseContext(context_);
+            throw std::runtime_error("Failed to create command queue: " + std::to_string(err));
+        }
     }
 
     void buildProgram() {
@@ -186,21 +202,42 @@ private:
         )";
 
         const char* source_ptr = source.c_str();
-        program_ = clCreateProgramWithSource(context_, 1, &source_ptr, nullptr, nullptr);
-        clBuildProgram(program_, 1, &device_, nullptr, nullptr, nullptr);
+        size_t source_len = source.length();
+        cl_int err;
+        program_ = clCreateProgramWithSource(context_, 1, &source_ptr, &source_len, &err);
+        if (err != CL_SUCCESS || !program_) {
+            throw std::runtime_error("Failed to create OpenCL program: " + std::to_string(err));
+        }
+        err = clBuildProgram(program_, 1, &device_, nullptr, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            // Get build log
+            size_t log_size;
+            clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+            std::vector<char> log(log_size);
+            clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
+            std::string log_str(log.data());
+            clReleaseProgram(program_);
+            program_ = nullptr;
+            throw std::runtime_error("Failed to build OpenCL program: " + std::to_string(err) + "\nBuild log:\n" + log_str);
+        }
     }
 
     void createKernels() {
-        ssm_update_kernel_fp32_ = clCreateKernel(program_, "ssm_update_kernel", nullptr);
-        // Add fp16 kernel creation if supported
+        cl_int err;
+        ssm_update_kernel_fp32_ = clCreateKernel(program_, "ssm_update_kernel", &err);
+        if (err != CL_SUCCESS) {
+            throw std::runtime_error("Failed to create ssm_update_kernel: " + std::to_string(err));
+        }
+        // Initialize fp16 kernel to nullptr - add creation if supported
+        ssm_update_kernel_fp16_ = nullptr;
     }
 
     void cleanup() {
-        clReleaseKernel(ssm_update_kernel_fp32_);
-        clReleaseKernel(ssm_update_kernel_fp16_);
-        clReleaseProgram(program_);
-        clReleaseCommandQueue(queue_);
-        clReleaseContext(context_);
+        if (ssm_update_kernel_fp32_) clReleaseKernel(ssm_update_kernel_fp32_);
+        if (ssm_update_kernel_fp16_) clReleaseKernel(ssm_update_kernel_fp16_);
+        if (program_) clReleaseProgram(program_);
+        if (queue_) clReleaseCommandQueue(queue_);
+        if (context_) clReleaseContext(context_);
     }
 };
 
@@ -220,47 +257,30 @@ void cleanup_opencl() {
     }
 }
 
-std::vector<array> ssm_update(
-    const array& x,
-    const array& dt,
-    const array& A,
-    const array& B,
-    const array& C,
-    const array& D,
-    const array& z,
-    const array& state
+// Standalone function for command-line usage
+void ssm_update_standalone(
+    const std::vector<float>& x,
+    const std::vector<float>& dt,
+    const std::vector<float>& A,
+    const std::vector<float>& B,
+    const std::vector<float>& C,
+    const std::vector<float>& D,
+    const std::vector<float>& z,
+    const std::vector<float>& state,
+    std::vector<float>& y,
+    std::vector<float>& next_state,
+    int batch_size,
+    int channel_size,
+    int state_size
 ) {
     if (!g_opencl_context) {
         initialize_opencl();
     }
 
-    // Convert arrays to vectors (simplified - in practice you'd want more efficient data handling)
-    std::vector<float> x_vec(x.data(), x.data() + x.size());
-    std::vector<float> dt_vec(dt.data(), dt.data() + dt.size());
-    std::vector<float> A_vec(A.data(), A.data() + A.size());
-    std::vector<float> B_vec(B.data(), B.data() + B.size());
-    std::vector<float> C_vec(C.data(), C.data() + C.size());
-    std::vector<float> D_vec(D.data(), D.data() + D.size());
-    std::vector<float> z_vec(z.data(), z.data() + z.size());
-    std::vector<float> state_vec(state.data(), state.data() + state.size());
-
-    std::vector<float> y_vec(x.size());
-    std::vector<float> next_state_vec(state.size());
-
-    int batch_size = x.shape(0);
-    int channel_size = x.shape(1);
-    int state_size = A.shape(0);
-
     g_opencl_context->ssm_update(
-        x_vec, dt_vec, A_vec, B_vec, C_vec, D_vec, z_vec, state_vec,
-        y_vec, next_state_vec, batch_size, channel_size, state_size
+        x, dt, A, B, C, D, z, state,
+        y, next_state, batch_size, channel_size, state_size
     );
-
-    // Convert back to arrays (simplified)
-    array y(y_vec.data(), x.shape());
-    array next_state(next_state_vec.data(), state.shape());
-
-    return {y, next_state};
 }
 
 } // namespace cartesia_opencl
