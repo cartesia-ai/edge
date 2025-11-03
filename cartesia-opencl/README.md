@@ -13,27 +13,26 @@ Adding OpenCL support would provide cross-platform GPU acceleration for state-sp
 
 ## Architecture
 
-### Directory Structure
+### Directory Structure (current)
 ```
 cartesia-opencl/
-├── pyproject.toml          # Package configuration
-├── setup.py               # Build configuration
-├── CMakeLists.txt         # CMake build system
-├── bindings.cpp           # Python bindings (nanobind)
-├── cartesia_opencl/
-│   ├── __init__.py        # Package initialization
-│   ├── interface.py       # High-level interface
-│   └── version.py         # Version information
+├── CMakeLists.txt                 # Build configuration for the OpenCL test binary
+├── build_android.sh               # Build script for Android (OpenCL test app)
+├── build_android_opencl_info.sh   # Builds a small OpenCL capability dumper for Android
+├── tools/
+│   └── decode_tokens.py           # Decodes generated token IDs to text
+├── opencl-headers/                # Khronos OpenCL headers (downloaded by scripts if missing)
 └── src/
-    ├── ssm_update.cl      # OpenCL kernel for SSM updates
-    ├── ssm_update.cpp     # C++ wrapper for SSM operations
-    ├── ssm_update.h       # Header file
-    ├── ssd_update.cl      # OpenCL kernel for SSD updates
-    ├── ssd_update.cpp     # C++ wrapper for SSD operations
-    ├── ssd_update.h       # Header file
-    ├── conv1d_*.cl        # OpenCL kernels for 1D convolutions
-    ├── conv1d_*.cpp       # C++ wrappers for convolution operations
-    └── conv1d_*.h         # Header files
+    ├── opencl_context.{h,cpp}     # OpenCL context/queue/program helpers
+    ├── layers/                    # Model layers implemented with OpenCL (+ CPU fallbacks)
+    │   ├── attention_layer.{h,cpp}
+    │   ├── linear_layer.{h,cpp}
+    │   ├── ssd_layer.{h,cpp}
+    │   ├── swiglu_layer.{h,cpp}
+    │   └── rms_norm_layer.{h,cpp}
+    ├── embedding.cpp              # Token embedding (CPU fallback + OpenCL buffers)
+    ├── lm_head.cpp                # Output projection head (CPU fallback + OpenCL buffers)
+    └── layers/*.cl (embedded)     # Kernel sources are embedded as raw strings in *.cpp
 ```
 
 ## Key Operations
@@ -95,97 +94,99 @@ The C++ wrapper provides:
 - Kernel execution and synchronization
 - Error handling and device selection
 
-### Python Bindings
+### Python Utilities
 
-Using nanobind for efficient Python bindings:
-- Direct array access without copying
-- Automatic memory management
-- Type safety and error handling
+This repo includes helper Python scripts in `tools/` (e.g., token decoding). There are no Python package modules such as `interface.py` or `version.py` in this directory.
 
 ## Build System
 
 ### Dependencies
-- **OpenCL SDK** - For GPU compute capabilities
+- **OpenCL SDK** - For GPU compute capabilities (provided by device at runtime)
 - **CMake** - Build system configuration
-- **nanobind** - Python bindings
-- **pyopencl** - Python OpenCL interface
+- **Android NDK** - For Android cross-compilation
 
 ### Build Configuration
-```cmake
-find_package(OpenCL REQUIRED)
-find_package(nanobind CONFIG REQUIRED)
-
-target_link_libraries(cartesia_opencl_ext PUBLIC ${OpenCL_LIBRARIES})
-```
+This project builds a standalone C++ OpenCL test binary via CMake. Android builds are driven by `build_android.sh`, which configures the NDK toolchain and links against OpenCL at runtime (kernels are embedded in the binary as strings).
 
 ## Integration with Existing Backends
 
-### Backend Selection
-The library would need a backend selection mechanism:
+## Usage
 
+### 1) Generate input tokens (using Hugging Face transformers)
+For now, tokens are generated on CPU using a standard tokenizer and saved as a raw int32 binary file that the C++ binary reads.
+
+Example (Python):
 ```python
-import cartesia_opencl as co
+from transformers import AutoTokenizer
+import numpy as np
 
-# Initialize OpenCL backend
-co.initialize_opencl()
+text = "Rene Descartes was"
+tokenizer = AutoTokenizer.from_pretrained("allenai/OLMo-1B-hf")
+ids = tokenizer.encode(text, add_special_tokens=False)
 
-# Use OpenCL operations
-y, next_state = co.ssm_update(x, dt, A, B, C, D, z, state)
+# Save as raw int32 little-endian binary (no header)
+np.asarray(ids, dtype=np.int32).tofile("prompt_tokens.bin")
+print(f"Wrote {len(ids)} tokens to prompt_tokens.bin: {ids}")
 ```
+
+This produces `prompt_tokens.bin` containing the prompt token IDs as 32-bit integers.
+
+### 2) Build for Android
+```bash
+./build_android.sh
+```
+
+### 3) Run on the Android device
+Push the binary and token file to the device and execute the test driver. Below is a minimal set of commands (replace paths as needed):
+
+```bash
+# Paths
+BIN=cartesia_opencl_test
+LOCAL_BUILD=./build_android_standalone/${BIN}
+DEVICE_BIN=/data/local/tmp/${BIN}
+LOCAL_PROMPT=./prompt_tokens.bin
+DEVICE_PROMPT=/data/local/tmp/prompt_tokens.bin
+DEVICE_OUTPUT=/data/local/tmp/output_tokens.bin
+
+# Copy
+adb push "${LOCAL_BUILD}" "${DEVICE_BIN}"
+adb push "${LOCAL_PROMPT}" "${DEVICE_PROMPT}"
+adb shell chmod +x "${DEVICE_BIN}"
+
+# Optional: skip attention kernel build and use CPU fallback to avoid driver hangs
+# (recommended on some devices)
+adb shell "export SKIP_ATTENTION_KERNELS=1 && ${DEVICE_BIN} ${DEVICE_PROMPT} ${DEVICE_OUTPUT} 10 1"
+
+# Arguments to the binary are:
+#   1) prompt_tokens_path (required)
+#   2) output_tokens_path  (optional; default: output_tokens.bin)
+#   3) max_tokens          (optional; default: 50)
+#   4) n_layer_repeats     (optional; default from model config; try 1 for reduced memory)
+
+# Pull the output back
+adb pull "${DEVICE_OUTPUT}" ./output_tokens.bin
+```
+
+### 4) Decode generated tokens back to text
+Use the provided tool to decode the generated token IDs:
+```bash
+python3 tools/decode_tokens.py ./output_tokens.bin --tokenizer allenai/OLMo-1B-hf --verbose
+```
+
+Notes:
+- On memory-constrained devices, start with `n_layer_repeats=1` to build a 12-layer model (instead of 48).
+- If attention kernel compilation hangs or crashes on the device, use `SKIP_ATTENTION_KERNELS=1` to activate the CPU fallback for attention while keeping other layers on OpenCL.
+
+### Running on Android
+- Build: `./build_android.sh`
+- Push and run: Use `adb` to copy the binary to device and execute
+- Outputs: `output_tokens.bin` (can be decoded via `tools/decode_tokens.py`)
 
 ### Performance Comparison
 Expected performance characteristics:
 - **GPU Acceleration**: 10-100x speedup over CPU for large batches
 - **Memory Bandwidth**: Optimized for high-throughput operations
 - **Latency**: Lower latency than PyTorch for custom operations
-
-## Challenges and Considerations
-
-### 1. Cross-Platform Compatibility
-- **Vendor Support**: Different OpenCL implementations (Intel, AMD, NVIDIA)
-- **Feature Support**: Not all devices support the same OpenCL features
-- **Performance**: Hardware-specific optimizations needed
-
-### 2. Memory Management
-- **Buffer Lifecycle**: Efficient OpenCL buffer management
-- **Data Transfer**: Minimize host-device data movement
-- **Memory Pools**: Reuse buffers for better performance
-
-### 3. Kernel Optimization
-- **Work Group Sizes**: Device-specific tuning
-- **Memory Access Patterns**: Coalesced memory access
-- **Computational Intensity**: Balance compute vs memory bandwidth
-
-### 4. Precision Support
-- **FP32**: Standard precision for most operations
-- **FP16**: Half precision for better performance (where supported)
-- **Mixed Precision**: Dynamic precision selection
-
-## Development Roadmap
-
-### Phase 1: Core Implementation
-- [ ] Basic OpenCL context setup
-- [ ] SSM update kernel implementation
-- [ ] Python bindings with nanobind
-- [ ] Basic testing and validation
-
-### Phase 2: Performance Optimization
-- [ ] Kernel optimization and tuning
-- [ ] Memory management improvements
-- [ ] Multi-device support
-- [ ] Benchmarking and profiling
-
-### Phase 3: Integration
-- [ ] Backend selection mechanism
-- [ ] Integration with existing models
-- [ ] Documentation and examples
-- [ ] CI/CD pipeline
-
-### Phase 4: Advanced Features
-- [ ] Chunked processing for long sequences
-- [ ] Dynamic kernel compilation
-- [ ] Advanced memory optimizations
-- [ ] Performance monitoring tools
 
 ## Comparison with Existing Backends
 

@@ -173,4 +173,5 @@ echo "  adb shell /data/local/tmp/dump_opencl_info"
 echo ""
 echo "Or run directly:"
 echo "  adb push $BUILD_DIR/dump_opencl_info /data/local/tmp/ && adb shell 'chmod +x /data/local/tmp/dump_opencl_info && /data/local/tmp/dump_opencl_info'"
+echo ""
 
