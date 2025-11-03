@@ -294,6 +294,8 @@ cl_mem LinearLayer::forward(cl_mem input, int batch_size, int seq_len, cl_comman
         // For now, bias is added in CPU fallback if needed
     }
     
+    // Retain buffer before returning so it survives when LinearLayer releases it on next call
+    clRetainMemObject(output_buffer_);
     return output_buffer_;
 }
 
@@ -370,6 +372,8 @@ cl_mem LinearLayer::step(cl_mem input, int batch_size, cl_command_queue queue) {
         throw std::runtime_error(error_msg);
     }
     
+    // Retain buffer before returning so it survives when LinearLayer releases it on next call
+    clRetainMemObject(output_buffer_);
     return output_buffer_;
 }
 

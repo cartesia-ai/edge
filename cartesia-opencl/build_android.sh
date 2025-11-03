@@ -2,19 +2,42 @@
 
 # Build script for Cartesia OpenCL standalone executable on Android
 # Requires Android NDK with CMake support
+# See BUILD_ENV.md for environment variable documentation
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/build_android_standalone"
+BUILD_DIR="${BUILD_DIR:-${SCRIPT_DIR}/build_android_standalone}"
 
-# Hardcoded Android NDK path
-NDK_PATH="/Users/alazarshenkute/Library/Android/sdk/ndk/19.2.5345600"
-
-# Allow override via environment variable
-if [ -n "$ANDROID_NDK" ]; then
-    NDK_PATH="$ANDROID_NDK"
+# Detect host architecture (darwin-x86_64, darwin-arm64, linux-x86_64, etc.)
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    HOST_ARCH="${HOST_ARCH:-darwin-$(uname -m)}"
+elif [[ "$OSTYPE" == "linux"* ]]; then
+    HOST_ARCH="${HOST_ARCH:-linux-$(uname -m)}"
+else
+    HOST_ARCH="${HOST_ARCH:-unknown}"
 fi
+
+# Android NDK path - try environment variable first, then common locations
+if [ -z "$ANDROID_NDK" ]; then
+    # Try common Android SDK locations
+    if [ -d "$HOME/Library/Android/sdk/ndk" ]; then
+        # macOS default, find latest NDK version
+        ANDROID_NDK=$(find "$HOME/Library/Android/sdk/ndk" -maxdepth 1 -type d | sort -V | tail -1)
+    elif [ -d "$HOME/Android/Sdk/ndk" ]; then
+        # Linux default
+        ANDROID_NDK=$(find "$HOME/Android/Sdk/ndk" -maxdepth 1 -type d | sort -V | tail -1)
+    fi
+fi
+
+if [ -z "$ANDROID_NDK" ] || [ ! -d "$ANDROID_NDK" ]; then
+    echo "Error: Android NDK not found"
+    echo "Please set ANDROID_NDK environment variable to point to your NDK installation"
+    echo "Example: export ANDROID_NDK=\$HOME/Library/Android/sdk/ndk/21.1.6352462"
+    exit 1
+fi
+
+NDK_PATH="$ANDROID_NDK"
 
 if [ ! -d "$NDK_PATH" ]; then
     echo "Error: Android NDK not found at: $NDK_PATH"
@@ -81,10 +104,13 @@ if [ ! -d "${OPENCL_HEADERS_DIR}/OpenCL-Headers/CL" ]; then
 fi
 
 # Create OpenCL stub library for linking (symbols resolved at runtime)
-OPENCL_STUB_LIB="/tmp/libOpenCL_stub.so"
+TEMP_DIR="${TEMP_DIR:-/tmp}"
+OPENCL_STUB_LIB="${OPENCL_STUB_LIB:-${TEMP_DIR}/libOpenCL_stub.so}"
+OPENCL_STUB_C="${TEMP_DIR}/opencl_stub.c"
+
 if [ ! -f "$OPENCL_STUB_LIB" ]; then
     echo "Creating OpenCL stub library for linking..."
-    cat > /tmp/opencl_stub.c << 'STUB_EOF'
+    cat > "$OPENCL_STUB_C" << 'STUB_EOF'
 #include <stddef.h>
 #include <stdint.h>
 // Stub with proper signatures - symbols resolved at runtime
@@ -127,61 +153,89 @@ cl_int clGetPlatformInfo(cl_platform_id platform, uint32_t param_name, size_t pa
 cl_int clGetDeviceInfo(cl_device_id device, uint32_t param_name, size_t param_value_size, void* param_value, size_t* param_value_size_ret) { return 0; }
 STUB_EOF
     
-    # Find the Android clang compiler  
-    ANDROID_CLANG="$NDK_PATH/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android22-clang"
+    # Android build configuration
+    ANDROID_API="${ANDROID_API:-21}"
+    ANDROID_ARCH="${ANDROID_ARCH:-aarch64}"
+    
+    # Find the Android clang compiler based on detected host architecture
+    NDK_TOOLCHAIN_DIR="$NDK_PATH/toolchains/llvm/prebuilt/${HOST_ARCH}"
+    if [ ! -d "$NDK_TOOLCHAIN_DIR" ]; then
+        # Try x86_64 variant if exact arch not found
+        if [[ "$HOST_ARCH" == *"arm64"* ]]; then
+            NDK_TOOLCHAIN_DIR="$NDK_PATH/toolchains/llvm/prebuilt/${HOST_ARCH/arm64/x86_64}"
+        fi
+    fi
+    
+    ANDROID_CLANG="${NDK_TOOLCHAIN_DIR}/bin/${ANDROID_ARCH}-linux-android${ANDROID_API}-clang"
     if [ ! -f "$ANDROID_CLANG" ]; then
-        ANDROID_CLANG=$(find "$NDK_PATH/toolchains" -name "*aarch64*clang*" -type f | head -1)
+        ANDROID_CLANG=$(find "$NDK_PATH/toolchains" -name "*${ANDROID_ARCH}*clang*" -type f | head -1)
     fi
     if [ ! -f "$ANDROID_CLANG" ]; then
-        ANDROID_CLANG="$NDK_PATH/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang"
+        ANDROID_CLANG="${NDK_TOOLCHAIN_DIR}/bin/clang"
     fi
     
     if [ -f "$ANDROID_CLANG" ]; then
-        # Use Android API 21 for maximum compatibility
+        echo "Using Android clang: $ANDROID_CLANG"
         "$ANDROID_CLANG" \
-            -target aarch64-linux-android21 \
-            --sysroot="$NDK_PATH/toolchains/llvm/prebuilt/darwin-x86_64/sysroot" \
+            -target ${ANDROID_ARCH}-linux-android${ANDROID_API} \
+            --sysroot="${NDK_TOOLCHAIN_DIR}/sysroot" \
             -shared -fPIC \
             -Wl,-soname,libOpenCL.so \
-            /tmp/opencl_stub.c -o "$OPENCL_STUB_LIB"
+            "$OPENCL_STUB_C" -o "$OPENCL_STUB_LIB"
         if [ -f "$OPENCL_STUB_LIB" ]; then
             echo "Created OpenCL stub library: $OPENCL_STUB_LIB"
         else
             echo "Warning: Failed to create stub library"
         fi
     else
-        echo "Warning: Could not find Android clang compiler"
+        echo "Warning: Could not find Android clang compiler at $ANDROID_CLANG"
     fi
-    rm -f /tmp/opencl_stub.c
+    rm -f "$OPENCL_STUB_C"
 fi
 
 # Check if Homebrew opencl-headers is installed and add to CMAKE_PREFIX_PATH if needed
-if [ -d "/usr/local/opt/opencl-headers" ] || [ -d "/opt/homebrew/opt/opencl-headers" ]; then
-    if [ -d "/usr/local/opt/opencl-headers" ]; then
-        export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:+$CMAKE_PREFIX_PATH:}/usr/local/opt/opencl-headers"
-        echo "Found Homebrew opencl-headers at /usr/local/opt/opencl-headers"
-    elif [ -d "/opt/homebrew/opt/opencl-headers" ]; then
-        export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:+$CMAKE_PREFIX_PATH:}/opt/homebrew/opt/opencl-headers"
-        echo "Found Homebrew opencl-headers at /opt/homebrew/opt/opencl-headers"
+HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-}"
+if [ -z "$HOMEBREW_PREFIX" ]; then
+    # Try to detect Homebrew prefix
+    if [ -d "/opt/homebrew" ]; then
+        HOMEBREW_PREFIX="/opt/homebrew"
+    elif [ -d "/usr/local" ]; then
+        HOMEBREW_PREFIX="/usr/local"
+    fi
+fi
+
+if [ -n "$HOMEBREW_PREFIX" ]; then
+    if [ -d "${HOMEBREW_PREFIX}/opt/opencl-headers" ]; then
+        export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:+$CMAKE_PREFIX_PATH:}${HOMEBREW_PREFIX}/opt/opencl-headers"
+        echo "Found Homebrew opencl-headers at ${HOMEBREW_PREFIX}/opt/opencl-headers"
     fi
 fi
 
 # Configure with Android NDK
-# Adjust API level and architecture as needed
-ANDROID_API=21
-ARCH=arm64
+ANDROID_API="${ANDROID_API:-21}"
+ANDROID_ABI="${ANDROID_ABI:-arm64-v8a}"
+CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
+ANDROID_STL="${ANDROID_STL:-c++_shared}"
+
+echo "Building with:"
+echo "  NDK: $NDK_PATH"
+echo "  Android API: $ANDROID_API"
+echo "  Android ABI: $ANDROID_ABI"
+echo "  Build type: $CMAKE_BUILD_TYPE"
+echo "  Host arch: $HOST_ARCH"
 
 cmake \
     -DCMAKE_TOOLCHAIN_FILE=$NDK_PATH/build/cmake/android.toolchain.cmake \
-    -DANDROID_ABI=arm64-v8a \
+    -DANDROID_ABI=${ANDROID_ABI} \
     -DANDROID_PLATFORM=android-${ANDROID_API} \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DANDROID_STL=c++_shared \
+    -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+    -DANDROID_STL=${ANDROID_STL} \
     ${CMAKE_PREFIX_PATH:+-DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}"} \
     -S .
 
 # Build
-cmake --build . --config Release
+CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+cmake --build . --config ${CMAKE_BUILD_TYPE} -j ${CMAKE_BUILD_PARALLEL_LEVEL}
 
 echo ""
 echo "Build complete!"

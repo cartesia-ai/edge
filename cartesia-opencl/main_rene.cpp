@@ -20,6 +20,32 @@
 
 using namespace cartesia_opencl;
 
+// Helper: Print device memory info
+void printMemoryInfo(cl_device_id device, const std::string& label) {
+    cl_ulong free_mem = 0;
+    cl_ulong total_mem = 0;
+    cl_int err;
+    
+    // Try to get global memory size (total available)
+    err = clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(cl_ulong), &total_mem, nullptr);
+    if (err == CL_SUCCESS) {
+        std::cout << "  [Memory " << label << "] Total device memory: " 
+                  << (total_mem / 1024 / 1024) << " MB" << std::endl;
+    }
+    
+    // Try to get max allocation size
+    size_t max_alloc = 0;
+    err = clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(size_t), &max_alloc, nullptr);
+    if (err == CL_SUCCESS) {
+        std::cout << "  [Memory " << label << "] Max allocation: " 
+                  << (max_alloc / 1024 / 1024) << " MB" << std::endl;
+    }
+    
+    // Note: OpenCL doesn't have a standard way to query free memory
+    // Some vendors provide extensions, but they're not universal
+    std::cout.flush();
+}
+
 // Helper: Read token IDs from binary file
 std::vector<int32_t> readTokenFile(const std::string& filename) {
     std::ifstream file(filename, std::ios::binary);
@@ -81,7 +107,7 @@ int main(int argc, char* argv[]) {
             std::cerr << "Usage: " << argv[0] << " <token_file.bin> [output_file.bin] [max_tokens] [n_layer_repeats]" << std::endl;
             std::cerr << "  token_file.bin: Input file with token IDs (int32 binary)" << std::endl;
             std::cerr << "  output_file.bin: Output file for generated tokens (default: output_tokens.bin)" << std::endl;
-            std::cerr << "  max_tokens: Maximum tokens to generate (default: 100)" << std::endl;
+            std::cerr << "  max_tokens: Maximum tokens to generate (default: 3)" << std::endl;
             std::cerr << "  n_layer_repeats: Number of layer repeats (1-" << N_LAYER_REPEATS 
                       << ", default: " << N_LAYER_REPEATS << "). "
                       << "Use 1 for testing to reduce memory usage." << std::endl;
@@ -90,7 +116,7 @@ int main(int argc, char* argv[]) {
         
         std::string token_file = argv[1];
         std::string output_file = (argc >= 3) ? argv[2] : "output_tokens.bin";
-        int max_tokens = (argc >= 4) ? std::stoi(argv[3]) : 100;
+        int max_tokens = (argc >= 4) ? std::stoi(argv[3]) : 3;
         int n_layer_repeats = (argc >= 5) ? std::stoi(argv[4]) : N_LAYER_REPEATS;
         
         if (n_layer_repeats < 1 || n_layer_repeats > N_LAYER_REPEATS) {
@@ -426,52 +452,84 @@ int main(int argc, char* argv[]) {
         cl_mem embeddings = embedding.encode(token_buffer, batch_size, seq_len, queue);
         std::cout << " ✓" << std::endl;
         
-        // Forward through sequence model
-        std::cout << "  Step 2: Forward pass through " << seq_model.getNumLayers() << " layers..." << std::flush;
-        std::vector<LayerState> states;  // Will be populated by stateful layers
-        cl_mem hidden = seq_model.forward(embeddings, batch_size, seq_len, &states, queue);
-        std::cout << " ✓" << std::endl;
-        
-        // Get last token's hidden state for generation
-        // For simplicity, we'll use the last token's embedding directly
-        // In a full implementation, we'd extract the last token's hidden state
-        
-        // Generate tokens
-        std::cout << "Generating " << max_tokens << " tokens..." << std::endl;
-        std::vector<int32_t> generated_tokens;
-        
-        // For the first step, we use the last token from prefill
-        // TODO: Extract last token properly from hidden states
-        int current_token_id = prompt_tokens.back();  // Placeholder - should be sampled from last logits
+    // Forward through sequence model
+    std::cout << "  Step 2: Forward pass through " << seq_model.getNumLayers() << " layers..." << std::flush;
+    std::vector<LayerState> states;  // Will be populated by stateful layers
+    cl_mem hidden = seq_model.forward(embeddings, batch_size, seq_len, &states, queue);
+    std::cout << " ✓" << std::endl;
+    
+    // Step 3: Get logits from last token and sample first generation token
+    std::cout << "  Step 3: Computing logits from last token..." << std::flush;
+    // LMHead expects [batch_size, d_model] as input and outputs [batch_size, vocab_size]
+    // Since seq_model outputs [batch_size, seq_len, d_model], we treat all tokens as a batch
+    int effective_batch_size = batch_size * seq_len;
+    cl_mem prefill_logits = lm_head.forward(hidden, effective_batch_size, queue);
+    std::cout << " ✓" << std::endl;
+    
+    // Extract logits for the last token in the sequence
+    // The LM head now outputs [batch_size * seq_len, vocab_size] = [7, 1000]
+    std::vector<float> all_logits(effective_batch_size * TEST_VOCAB_SIZE);
+    cl_int err = clEnqueueReadBuffer(queue, prefill_logits, CL_TRUE, 0, 
+                                     all_logits.size() * sizeof(float), 
+                                     all_logits.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to read prefill logits from device");
+    }
+    
+    // Get last token's logits (last position in the effective batch)
+    size_t last_token_offset = (seq_len - 1) * TEST_VOCAB_SIZE;
+    std::vector<float> last_token_logits(all_logits.begin() + last_token_offset, 
+                                         all_logits.begin() + last_token_offset + TEST_VOCAB_SIZE);
+    
+    // Sample first token from prefill logits
+    std::cout << "  Step 4: Sampling first token from prefill logits..." << std::flush;
+    int current_token_id = sampler.topPSample(last_token_logits, DEFAULT_TOP_P, DEFAULT_TEMPERATURE);
+    std::cout << " ✓ (token=" << current_token_id << ")" << std::endl;
+    
+    // Release prefill logits buffer
+    clReleaseMemObject(prefill_logits);
+    
+    // Generate tokens
+    std::cout << "Generating " << max_tokens << " tokens..." << std::endl;
+    cl_device_id device = ctx_mgr.getDevice();
+    printMemoryInfo(device, "Before Generation");
+    std::vector<int32_t> generated_tokens;
         
         for (int i = 0; i < max_tokens; ++i) {
-            std::cout << "[Gen] Step " << (i+1) << " / " << max_tokens << std::endl;
+            std::cout << "\n[Gen] Step " << (i+1) << " / " << max_tokens << std::endl;
+            printMemoryInfo(device, "Step " + std::to_string(i+1));
+            std::cout.flush();
             cl_mem current_token_buf = nullptr;
             cl_mem current_embedding = nullptr;
             cl_mem next_hidden = nullptr;
             cl_mem logits = nullptr;
             try {
                 std::cout << "  [Gen] EncodeStep: token_id=" << current_token_id << std::endl;
+                std::cout.flush();
                 // Encode current token
                 std::vector<int32_t> current_token_vec = {current_token_id};
                 current_token_buf = createTokenBuffer(context, current_token_vec);
                 current_embedding = embedding.encodeStep(current_token_buf, batch_size, queue);
                 if (!current_embedding) throw std::runtime_error("encodeStep returned null buffer");
                 std::cout << "  [Gen] EncodeStep ✓" << std::endl;
+                std::cout.flush();
                 
                 // Step through sequence model
                 next_hidden = seq_model.step(current_embedding, batch_size, &states, queue);
                 if (!next_hidden) throw std::runtime_error("seq_model.step returned null buffer");
                 std::cout << "  [Gen] seq_model.step ✓" << std::endl;
+                std::cout.flush();
                 
                 // Get logits from LM head
                 logits = lm_head.forward(next_hidden, batch_size, queue);
                 if (!logits) throw std::runtime_error("LMHead.forward returned null buffer");
                 std::cout << "  [Gen] LMHead.forward ✓" << std::endl;
+                std::cout.flush();
                 
                 // Ensure all writes are visible before CPU read in sampler
                 clFinish(queue);
                 std::cout << "  [Gen] clFinish ✓" << std::endl;
+                std::cout.flush();
                 
                 // Sample next token (use TEST_VOCAB_SIZE)
                 int next_token = sampler.sampleFromBuffer(
@@ -479,6 +537,8 @@ int main(int argc, char* argv[]) {
                     DEFAULT_TOP_P, DEFAULT_TEMPERATURE
                 );
                 std::cout << "  [Gen] sample ✓ -> token=" << next_token << std::endl;
+                // printMemoryInfo(device, "After Step " + std::to_string(i+1));
+                std::cout.flush();
                 
                 // Clamp token ID to valid range
                 if (next_token >= TEST_VOCAB_SIZE) {
@@ -519,10 +579,17 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        // Cleanup
-        clReleaseMemObject(token_buffer);
-        clReleaseMemObject(embeddings);
-        clReleaseMemObject(hidden);
+        std::cout << std::endl;
+        std::cout << "Generation loop completed!" << std::endl;
+        // printMemoryInfo(device, "After All Steps");
+        std::cout.flush();
+        
+        // Cleanup - protect against double-release
+        std::cout << "Cleaning up prefill buffers..." << std::flush;
+        if (token_buffer) clReleaseMemObject(token_buffer);
+        if (embeddings) clReleaseMemObject(embeddings);
+        if (hidden) clReleaseMemObject(hidden);
+        std::cout << " ✓" << std::endl;
         
         std::cout << std::endl;
         std::cout << "Generation complete!" << std::endl;

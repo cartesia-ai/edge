@@ -965,7 +965,11 @@ cl_mem AttentionLayer::step(
         }
         
         if (!keys_concat_ || keys_concat_size_ < concat_bytes) {
-            if (keys_concat_) clReleaseMemObject(keys_concat_);
+            // Only release keys_concat_ if it's NOT the same as state->state1
+            // (which has a retained reference to it)
+            if (keys_concat_ && keys_concat_ != state->state1) {
+                clReleaseMemObject(keys_concat_);
+            }
             keys_concat_ = clCreateBuffer(context, CL_MEM_READ_WRITE, concat_bytes, nullptr, &err);
             if (err != CL_SUCCESS || !keys_concat_) {
                 throw std::runtime_error("Failed to create keys_concat buffer (err=" + std::to_string(err) + ", size=" + std::to_string(concat_bytes) + ")");
@@ -973,7 +977,10 @@ cl_mem AttentionLayer::step(
             keys_concat_size_ = concat_bytes;
         }
         if (!values_concat_ || values_concat_size_ < concat_bytes) {
-            if (values_concat_) clReleaseMemObject(values_concat_);
+            // Only release values_concat_ if it's NOT the same as state->state2
+            if (values_concat_ && values_concat_ != state->state2) {
+                clReleaseMemObject(values_concat_);
+            }
             values_concat_ = clCreateBuffer(context, CL_MEM_READ_WRITE, concat_bytes, nullptr, &err);
             if (err != CL_SUCCESS || !values_concat_) {
                 throw std::runtime_error("Failed to create values_concat buffer (err=" + std::to_string(err) + ", size=" + std::to_string(concat_bytes) + ")");

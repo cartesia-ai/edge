@@ -240,13 +240,17 @@ cl_mem SwiGLULayer::step(
     }
     
     // Gate and up projections
+    std::cout << " [gate_proj]..." << std::flush;
     cl_mem gate_out = gate_layer_->step(input, batch_size, queue);
+    std::cout << " [up_proj]..." << std::flush;
     cl_mem up_out = up_layer_->step(input, batch_size, queue);
     
     // Apply Swish to gate
+    std::cout << " [swish]..." << std::flush;
     cl_mem gate_swish = applySwishStep(gate_out, batch_size, queue);
     
     // Combine
+    std::cout << " [combine]..." << std::flush;
     cl_context context = ctx_->getContext();
     int size = batch_size * d_inner_;
     
@@ -273,6 +277,7 @@ cl_mem SwiGLULayer::step(
     }
     
     // Down projection
+    std::cout << " [down_proj]..." << std::flush;
     cl_mem output = down_layer_->step(intermediate_step_, batch_size, queue);
     
     return output;

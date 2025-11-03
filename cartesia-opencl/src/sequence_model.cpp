@@ -113,6 +113,11 @@ cl_mem SequenceModel::step(
                 }
             }
             
+            // Add more detailed logging for layer 11 (last layer)
+            if (i == 11) {
+                std::cout << " [calling step]..." << std::flush;
+            }
+            
             if (layers_[i]->isStateful()) {
                 current = layers_[i]->step(current, batch_size, layer_state, queue);
                 if (!current) {
@@ -124,6 +129,11 @@ cl_mem SequenceModel::step(
                 if (!current) {
                     throw std::runtime_error("Layer " + std::to_string(i) + " returned null buffer");
                 }
+            }
+            
+            // Add more detailed logging for layer 11
+            if (i == 11) {
+                std::cout << " [validating output]..." << std::flush;
             }
             
             // Validate output buffer
