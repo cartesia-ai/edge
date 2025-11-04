@@ -37,7 +37,7 @@ if [ -z "$ANDROID_NDK" ] || [ ! -d "$ANDROID_NDK" ]; then
     exit 1
 fi
 
-NDK_PATH="$ANDROID_NDK"
+    NDK_PATH="$ANDROID_NDK"
 
 if [ ! -d "$NDK_PATH" ]; then
     echo "Error: Android NDK not found at: $NDK_PATH"

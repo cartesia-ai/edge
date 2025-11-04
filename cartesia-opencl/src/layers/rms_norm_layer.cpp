@@ -4,6 +4,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <iostream>
+#include <cmath>
 #include <CL/cl.h>
 
 namespace cartesia_opencl {
@@ -23,10 +24,10 @@ RMSNormLayer::RMSNormLayer(OpenCLContextManager* ctx, int d_model)
     }
     
     // Debug output
-    size_t buffer_size_kb = (d_model * sizeof(float)) / 1024;
-    std::cout << "  [RMSNorm] d_model=" << d_model 
-              << ", params=" << d_model
-              << ", buffer_size=" << buffer_size_kb << " KB" << std::endl;
+    // size_t buffer_size_kb = (d_model * sizeof(float)) / 1024;
+    // std::cout << "  [RMSNorm] d_model=" << d_model 
+    //           << ", params=" << d_model
+    //           << ", buffer_size=" << buffer_size_kb << " KB" << std::endl;
     
     buildKernels();
 }
@@ -60,10 +61,28 @@ __kernel void rms_norm(
     const int seq_idx = idx / d_model;
     const int feat_idx = idx % d_model;
     
+    // Clamp input values to prevent Inf/NaN propagation
+    float input_val = input[idx];
+    if (isnan(input_val) || isinf(input_val)) {
+        output[idx] = 0.0f;
+        return;
+    }
+    
+    // Clamp to reasonable range to prevent overflow in mean_square calculation
+    float clamped_input = input_val;
+    const float max_val = 1e10f;  // Reasonable maximum to prevent overflow
+    const float min_val = -1e10f;
+    if (clamped_input > max_val) clamped_input = max_val;
+    if (clamped_input < min_val) clamped_input = min_val;
+    
     // Calculate mean square within this sequence element
     float mean_square = 0.0f;
     for (int i = 0; i < d_model; ++i) {
         float val = input[seq_idx * d_model + i];
+        // Clamp values to prevent overflow
+        if (val > max_val) val = max_val;
+        if (val < min_val) val = min_val;
+        if (isnan(val) || isinf(val)) val = 0.0f;
         mean_square += val * val;
     }
     mean_square /= d_model;
@@ -71,8 +90,23 @@ __kernel void rms_norm(
     // RMS = sqrt(mean_square + eps)
     float rms = sqrt(mean_square + eps);
     
+    // Ensure rms is valid
+    if (isnan(rms) || isinf(rms) || rms <= 0.0f) {
+        rms = 1.0f;  // Safe fallback
+    }
+    
     // Normalize: output = (input / rms) * weight
-    output[idx] = (input[idx] / rms) * weight[feat_idx];
+    float weight_val = weight[feat_idx];
+    if (isnan(weight_val) || isinf(weight_val)) {
+        weight_val = 1.0f;  // Safe fallback
+    }
+    
+    output[idx] = (clamped_input / rms) * weight_val;
+    
+    // Final clamp to prevent Inf/NaN in output
+    if (isnan(output[idx]) || isinf(output[idx])) {
+        output[idx] = 0.0f;
+    }
 }
 )";
     
@@ -118,15 +152,78 @@ cl_mem RMSNormLayer::forward(cl_mem input, int batch_size, int seq_len, cl_comma
     int total_elements = batch_size * seq_len * d_model_;
     size_t output_size = total_elements * sizeof(float);
     
-    // Allocate output buffer
-    if (!output_buffer_ || output_buffer_size_ < output_size) {
-        if (output_buffer_) clReleaseMemObject(output_buffer_);
-        output_buffer_ = clCreateBuffer(context, CL_MEM_WRITE_ONLY, output_size, nullptr, nullptr);
-        if (!output_buffer_) {
-            throw std::runtime_error("Failed to create RMS norm output buffer");
-        }
-        output_buffer_size_ = output_size;
+    // Create a NEW output buffer for each call to avoid stale data issues
+    // Use CL_MEM_READ_WRITE so we can explicitly initialize it to zero
+    cl_mem output_buffer = nullptr;
+    output_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, output_size, nullptr, nullptr);
+    if (!output_buffer) {
+        throw std::runtime_error("Failed to create RMS norm output buffer");
     }
+    
+    // Explicitly zero the buffer using a simple kernel to ensure it works
+    // clEnqueueFillBuffer might not be reliable on all devices
+    static cl_kernel zero_kernel = nullptr;
+    static bool zero_kernel_built = false;
+    
+    if (!zero_kernel_built) {
+        const char* zero_kernel_source = R"(
+__kernel void zero_buffer(__global float* buffer, const int size) {
+    int idx = get_global_id(0);
+    if (idx < size) {
+        buffer[idx] = 0.0f;
+    }
+}
+)";
+        auto& ctx_mgr = OpenCLContextManager::getInstance();
+        std::vector<std::string> sources = {std::string(zero_kernel_source)};
+        std::string cache_key = ctx_mgr.generateCacheKey(sources) + "_zero";
+        cl_program zero_program = ctx_mgr.buildProgram(sources, cache_key);
+        zero_kernel = ctx_mgr.getKernel(zero_program, "zero_buffer");
+        zero_kernel_built = true;
+    }
+    
+    if (zero_kernel) {
+        cl_int zero_err = clSetKernelArg(zero_kernel, 0, sizeof(cl_mem), &output_buffer);
+        zero_err |= clSetKernelArg(zero_kernel, 1, sizeof(int), &total_elements);
+        if (zero_err == CL_SUCCESS) {
+            size_t zero_global = ((total_elements + 63) / 64) * 64;  // Round to multiple of 64
+            size_t zero_local = 64;
+            cl_int launch_err = clEnqueueNDRangeKernel(queue, zero_kernel, 1, nullptr, 
+                                                       &zero_global, &zero_local, 0, nullptr, nullptr);
+            if (launch_err == CL_SUCCESS) {
+                clFinish(queue);  // Ensure zeroing completes
+                
+                // Debug: Verify zero kernel worked for layer 6
+                static int zero_check_count = 0;
+                zero_check_count++;
+                if (zero_check_count == 7) {  // Layer 6
+                    std::vector<float> zero_check(total_elements);
+                    cl_int check_err = clEnqueueReadBuffer(queue, output_buffer, CL_TRUE, 0,
+                        output_size, zero_check.data(), 0, nullptr, nullptr);
+                    if (check_err == CL_SUCCESS) {
+                        int non_zero_count = 0;
+                        int nan_count = 0;
+                        for (size_t i = 0; i < zero_check.size(); ++i) {
+                            if (zero_check[i] != 0.0f) {
+                                non_zero_count++;
+                                if (std::isnan(zero_check[i])) nan_count++;
+                            }
+                        }
+                        std::cout << "  [RMSNorm Zero Check] After zero kernel: " << non_zero_count 
+                                  << " non-zero values, " << nan_count << " NaNs out of " 
+                                  << total_elements << " values" << std::endl;
+                    }
+                }
+            }
+        }
+    }
+    
+    // If we had a previous buffer, release it (but keep the size for comparison)
+    if (output_buffer_) {
+        clReleaseMemObject(output_buffer_);
+    }
+    output_buffer_ = output_buffer;
+    output_buffer_size_ = output_size;
     
     // Set kernel arguments
     cl_int err;
@@ -144,9 +241,142 @@ cl_mem RMSNormLayer::forward(cl_mem input, int batch_size, int seq_len, cl_comma
     
     // Execute kernel
     size_t global_size = total_elements;
-    err = clEnqueueNDRangeKernel(queue, kernel_, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    
+    // Use a local work-group size that evenly divides the global size
+    // 7168 = 7 * 1024, so we can use 64, 128, 256, or 512 as local size
+    // Using 64 to ensure maximum compatibility
+    size_t local_size = 64;
+    
+    // Round global_size up to be a multiple of local_size (OpenCL requirement)
+    size_t rounded_global = ((global_size + local_size - 1) / local_size) * local_size;
+    
+    // Debug: Check device work-group size limits for layer 6
+    static int kernel_launch_count = 0;
+    kernel_launch_count++;
+    if (kernel_launch_count == 7) {  // Layer 6
+        size_t max_work_group_size = 0;
+        cl_int wg_err = clGetKernelWorkGroupInfo(kernel_, ctx_->getDevice(), CL_KERNEL_WORK_GROUP_SIZE,
+                                                 sizeof(size_t), &max_work_group_size, nullptr);
+        if (wg_err == CL_SUCCESS && max_work_group_size < local_size) {
+            local_size = max_work_group_size;
+            rounded_global = ((global_size + local_size - 1) / local_size) * local_size;
+        }
+        if (wg_err == CL_SUCCESS) {
+            std::cout << "  [RMSNorm Layer 6 Kernel Debug] Max work-group size: " << max_work_group_size 
+                      << ", Using local size: " << local_size 
+                      << ", Global size: " << global_size 
+                      << " (rounded to: " << rounded_global << ")" << std::endl;
+        }
+    }
+    
+    // Launch with explicit local size to ensure all work items execute
+    err = clEnqueueNDRangeKernel(queue, kernel_, 1, nullptr, &rounded_global, &local_size, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
-        throw std::runtime_error("Failed to enqueue RMS norm kernel");
+        throw std::runtime_error("Failed to enqueue RMS norm kernel, error=" + std::to_string(err));
+    }
+    
+    // Ensure kernel completes before returning buffer
+    clFinish(queue);
+    
+    // Retain buffer before returning to ensure it stays valid
+    clRetainMemObject(output_buffer_);
+    
+    // Debug: Check RMSNorm input, weights, and output for layer 6
+    static int rms_check_count = 0;
+    rms_check_count++;
+    if (rms_check_count == 7) {  // Layer 6's RMSNorm (after layers 0-5)
+        // First check the INPUT buffer
+        std::vector<float> rms_input(total_elements);
+        cl_int input_check_err = clEnqueueReadBuffer(queue, input, CL_TRUE, 0,
+            output_size, rms_input.data(), 0, nullptr, nullptr);
+        if (input_check_err == CL_SUCCESS) {
+            int input_nan_count = 0;
+            std::vector<int> input_nan_per_token(seq_len, 0);
+            std::vector<float> token_sum(seq_len, 0.0f);
+            std::vector<float> token_sum_sq(seq_len, 0.0f);
+            for (size_t i = 0; i < rms_input.size(); ++i) {
+                int token_idx = i / d_model_;
+                if (token_idx < seq_len) {
+                    float val = rms_input[i];
+                    if (std::isnan(val)) {
+                        input_nan_count++;
+                        input_nan_per_token[token_idx]++;
+                    } else if (std::isinf(val)) {
+                        input_nan_count++;  // Treat Inf as problematic
+                        input_nan_per_token[token_idx]++;
+                    } else {
+                        token_sum[token_idx] += val;
+                        token_sum_sq[token_idx] += val * val;
+                    }
+                }
+            }
+            std::cout << "  [RMSNorm Layer 6 Input Debug] Input has " << input_nan_count 
+                      << " NaN/Inf out of " << total_elements << " values" << std::endl;
+            std::cout << "  [RMSNorm Layer 6 Input Debug] Input NaN/Inf per token: ";
+            for (int i = 0; i < seq_len; ++i) {
+                std::cout << "token" << i << "=" << input_nan_per_token[i] << "/" << d_model_ << " ";
+            }
+            std::cout << std::endl;
+            std::cout << "  [RMSNorm Layer 6 Input Debug] Token sum_sq (mean_sq proxy): ";
+            for (int i = 0; i < seq_len; ++i) {
+                float mean_sq_proxy = token_sum_sq[i] / d_model_;
+                std::cout << "token" << i << "=" << mean_sq_proxy << " ";
+            }
+            std::cout << std::endl;
+        }
+        
+        // Check weights for NaN
+        std::vector<float> weights_check(d_model_);
+        size_t weights_size = d_model_ * sizeof(float);
+        cl_int weights_check_err = clEnqueueReadBuffer(queue, weights_buffer_, CL_TRUE, 0,
+            weights_size, weights_check.data(), 0, nullptr, nullptr);
+        if (weights_check_err == CL_SUCCESS) {
+            int weights_nan_count = 0;
+            for (float w : weights_check) {
+                if (std::isnan(w) || std::isinf(w)) {
+                    weights_nan_count++;
+                }
+            }
+            std::cout << "  [RMSNorm Layer 6 Weights Debug] Weights have " << weights_nan_count 
+                      << " NaN/Inf out of " << d_model_ << " values" << std::endl;
+        }
+        
+        // Then check the OUTPUT buffer
+        std::vector<float> rms_output(total_elements);
+        cl_int check_err = clEnqueueReadBuffer(queue, output_buffer_, CL_TRUE, 0,
+            output_size, rms_output.data(), 0, nullptr, nullptr);
+        if (check_err == CL_SUCCESS) {
+            int nan_count = 0;
+            std::vector<int> nan_per_token(seq_len, 0);
+            for (size_t i = 0; i < rms_output.size(); ++i) {
+                if (std::isnan(rms_output[i])) {
+                    nan_count++;
+                    int token_idx = i / d_model_;
+                    if (token_idx < seq_len) {
+                        nan_per_token[token_idx]++;
+                    }
+                }
+            }
+            std::cout << "  [RMSNorm Layer 6 Debug] Output: " << nan_count 
+                      << " NaNs out of " << total_elements << " values" << std::endl;
+            std::cout << "  [RMSNorm Layer 6 Debug] NaNs per token: ";
+            for (int i = 0; i < seq_len; ++i) {
+                std::cout << "token" << i << "=" << nan_per_token[i] << "/" << d_model_ << " ";
+            }
+            std::cout << std::endl;
+            
+            // Check token 5 specifically
+            std::cout << "  [RMSNorm Layer 6 Debug] Token 5 first 5 values: ";
+            for (int i = 5 * d_model_; i < 5 * d_model_ + 5; ++i) {
+                std::cout << rms_output[i] << " ";
+            }
+            std::cout << std::endl;
+            std::cout << "  [RMSNorm Layer 6 Debug] Token 0 first 5 values: ";
+            for (int i = 0; i < 5; ++i) {
+                std::cout << rms_output[i] << " ";
+            }
+            std::cout << std::endl;
+        }
     }
     
     return output_buffer_;

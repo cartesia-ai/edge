@@ -36,12 +36,12 @@ SwiGLULayer::SwiGLULayer(OpenCLContextManager* ctx, int d_model, int expand)
     size_t down_params = static_cast<size_t>(d_model) * d_inner_;
     size_t total_params = gate_params + up_params + down_params;
     size_t buffer_size_mb = (total_params * sizeof(float)) / (1024 * 1024);
-    std::cout << "  [SwiGLU] d_model=" << d_model 
-              << ", expand=" << expand
-              << ", d_inner=" << d_inner_
-              << ", params=" << total_params
-              << " (gate:" << gate_params << ", up:" << up_params << ", down:" << down_params << ")"
-              << ", buffer_size=" << buffer_size_mb << " MB" << std::endl;
+    // std::cout << "  [SwiGLU] d_model=" << d_model 
+    //           << ", expand=" << expand
+    //           << ", d_inner=" << d_inner_
+    //           << ", params=" << total_params
+    //           << " (gate:" << gate_params << ", up:" << up_params << ", down:" << down_params << ")"
+    //           << ", buffer_size=" << buffer_size_mb << " MB" << std::endl;
     
     // Create linear layers
     gate_layer_ = std::make_unique<LinearLayer>(ctx_, d_model, d_inner_, false);
@@ -70,8 +70,44 @@ __kernel void swish(
     if (idx >= size) return;
     
     float x = input[idx];
-    float sigmoid_x = 1.0f / (1.0f + exp(-x));
+    
+    // Clamp input to prevent Inf/NaN
+    if (isnan(x) || isinf(x)) {
+        output[idx] = 0.0f;
+        return;
+    }
+    
+    // Clamp to reasonable range to prevent exp overflow
+    const float max_val = 50.0f;  // exp(-50) is very close to 0, safe for sigmoid
+    const float min_val = -50.0f;  // exp(50) would overflow, but we use exp(-x) so -50 means exp(50)
+    if (x > max_val) x = max_val;
+    if (x < min_val) x = min_val;
+    
+    // Compute sigmoid with overflow protection
+    // For large negative x, exp(-x) can overflow, so use: 1 / (1 + exp(-x)) ≈ 0
+    // For large positive x, exp(-x) ≈ 0, so sigmoid ≈ 1
+    float sigmoid_x;
+    if (x < -50.0f) {
+        sigmoid_x = 0.0f;
+    } else if (x > 50.0f) {
+        sigmoid_x = 1.0f;
+    } else {
+        float exp_val = exp(-x);
+        if (isinf(exp_val) || isnan(exp_val)) {
+            // Overflow protection
+            sigmoid_x = (x < 0.0f) ? 0.0f : 1.0f;
+        } else {
+            sigmoid_x = 1.0f / (1.0f + exp_val);
+        }
+    }
+    
+    // Compute swish: x * sigmoid(x)
     output[idx] = x * sigmoid_x;
+    
+    // Final check
+    if (isnan(output[idx]) || isinf(output[idx])) {
+        output[idx] = 0.0f;
+    }
 }
 
 // SwiGLU: (Swish(gate) * up) 
@@ -85,7 +121,31 @@ __kernel void swiglu_combine(
     const int idx = get_global_id(0);
     if (idx >= size) return;
     
-    output[idx] = gate[idx] * up[idx];
+    float gate_val = gate[idx];
+    float up_val = up[idx];
+    
+    // Check for Inf/NaN and clamp
+    if (isnan(gate_val) || isinf(gate_val)) {
+        gate_val = 0.0f;
+    }
+    if (isnan(up_val) || isinf(up_val)) {
+        up_val = 0.0f;
+    }
+    
+    // Clamp to prevent overflow
+    const float max_val = 1e10f;
+    const float min_val = -1e10f;
+    if (gate_val > max_val) gate_val = max_val;
+    if (gate_val < min_val) gate_val = min_val;
+    if (up_val > max_val) up_val = max_val;
+    if (up_val < min_val) up_val = min_val;
+    
+    output[idx] = gate_val * up_val;
+    
+    // Final check
+    if (isnan(output[idx]) || isinf(output[idx])) {
+        output[idx] = 0.0f;
+    }
 }
 )";
     

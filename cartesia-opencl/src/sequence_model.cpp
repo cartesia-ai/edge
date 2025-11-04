@@ -4,6 +4,8 @@
 #include <stdexcept>
 #include <CL/cl.h>
 #include <iostream>
+#include <vector>
+#include <cmath>
 
 namespace cartesia_opencl {
 
@@ -49,6 +51,26 @@ cl_mem SequenceModel::forward(
     for (size_t i = 0; i < layers_.size(); ++i) {
         LayerState* layer_state = state ? &((*state)[i]) : nullptr;
         
+        // Check input to layer 6 (first attention layer) for NaN
+        static bool checked_layer6_input = false;
+        if (!checked_layer6_input && i == 6 && current) {
+            size_t buf_size = 0;
+            cl_int info_err = clGetMemObjectInfo(current, CL_MEM_SIZE, sizeof(size_t), &buf_size, nullptr);
+            if (info_err == CL_SUCCESS && buf_size > 0) {
+                std::vector<float> layer6_input(buf_size / sizeof(float));
+                cl_int read_err = clEnqueueReadBuffer(queue, current, CL_TRUE, 0, buf_size, layer6_input.data(), 0, nullptr, nullptr);
+                if (read_err == CL_SUCCESS) {
+                    int nan_count = 0;
+                    for (float val : layer6_input) {
+                        if (std::isnan(val)) { nan_count++; }
+                    }
+                    std::cout << "\n  [Layer 6 Input Check] Before attention forward(): " << nan_count 
+                              << " NaNs out of " << layer6_input.size() << " values" << std::endl;
+                }
+            }
+            checked_layer6_input = true;
+        }
+        
         if (layers_[i]->isStateful()) {
             // Stateful layer returns (output, state)
             current = layers_[i]->forward(current, batch_size, seq_len, layer_state, queue);
@@ -56,6 +78,41 @@ cl_mem SequenceModel::forward(
             // Stateless layer returns just output
             LayerState dummy_state = LayerState::null();
             current = layers_[i]->forward(current, batch_size, seq_len, &dummy_state, queue);
+        }
+        
+        // NaN check for prefill (check first 6 layers to find where NaN originates)
+        static bool checked_prefill = false;
+        if (!checked_prefill && current && i < 6) {  // Only check layers 0-5
+            size_t buf_size = 0;
+            cl_int info_err = clGetMemObjectInfo(current, CL_MEM_SIZE, sizeof(size_t), &buf_size, nullptr);
+            if (info_err == CL_SUCCESS && buf_size > 0) {
+                std::vector<float> layer_output(buf_size / sizeof(float));
+                cl_int read_err = clEnqueueReadBuffer(queue, current, CL_TRUE, 0, buf_size, layer_output.data(), 0, nullptr, nullptr);
+                if (read_err == CL_SUCCESS) {
+                    int nan_count = 0;
+                    for (float val : layer_output) {
+                        if (std::isnan(val)) { nan_count++; }
+                    }
+                    // Always print for layers 0-5, even if no NaN (helps debugging)
+                    std::cout << "\n  [Prefill NaN Check] Layer " << i << " output: " << nan_count 
+                              << " NaNs out of " << layer_output.size() << " values" << std::endl;
+                    if (i == 5) {
+                        checked_prefill = true;  // Only set flag after checking layer 5
+                        // Also check the buffer again right after layer 5 (before layer 6)
+                        clFinish(queue);  // Ensure all writes are complete
+                        std::vector<float> layer5_final(buf_size / sizeof(float));
+                        cl_int final_read = clEnqueueReadBuffer(queue, current, CL_TRUE, 0, buf_size, layer5_final.data(), 0, nullptr, nullptr);
+                        if (final_read == CL_SUCCESS) {
+                            int nan_count_final = 0;
+                            for (float val : layer5_final) {
+                                if (std::isnan(val)) { nan_count_final++; }
+                            }
+                            std::cout << "  [After Layer 5 Check] Buffer after layer 5 complete: " << nan_count_final 
+                                      << " NaNs out of " << layer5_final.size() << " values" << std::endl;
+                        }
+                    }
+                }
+            }
         }
     }
     
@@ -142,6 +199,26 @@ cl_mem SequenceModel::step(
             info_err = clGetMemObjectInfo(current, CL_MEM_SIZE, sizeof(size_t), &buf_size, nullptr);
             if (info_err != CL_SUCCESS) {
                 throw std::runtime_error("Layer " + std::to_string(i) + " returned invalid buffer (err=" + std::to_string(info_err) + ")");
+            }
+            
+            // NaN/Inf check for first generation step only
+            static bool nan_check_done = false;
+            if (!nan_check_done && buf_size > 0) {
+                std::vector<float> layer_output(buf_size / sizeof(float));
+                cl_int read_err = clEnqueueReadBuffer(queue, current, CL_TRUE, 0, buf_size, layer_output.data(), 0, nullptr, nullptr);
+                if (read_err == CL_SUCCESS) {
+                    int nan_count = 0;
+                    int inf_count = 0;
+                    for (float val : layer_output) {
+                        if (std::isnan(val)) { nan_count++; }
+                        if (std::isinf(val)) { inf_count++; }
+                        if (nan_count > 0 && inf_count > 0) break;  // Early exit if both found
+                    }
+                    if (nan_count > 0 || inf_count > 0) {
+                        std::cout << " [Layer " << i << " output: " << nan_count << " NaNs, " << inf_count << " Infs!]";
+                        nan_check_done = true;  // Stop checking after first NaN/Inf found
+                    }
+                }
             }
             
             std::cout << " ✓" << std::endl;

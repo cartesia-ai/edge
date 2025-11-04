@@ -38,8 +38,10 @@ private:
     int vocab_size_;
     int d_model_;
     
-    // Embedding weights stored in OpenCL buffer
-    cl_mem weights_buffer_;
+    // Embedding weights split into chunks to fit device memory limits
+    std::vector<cl_mem> weights_buffers_;  // Multiple chunks
+    int chunk_size_;                        // Vocab tokens per chunk
+    int num_chunks_;                        // Number of chunks
     bool weights_initialized_;
     
     // Temporary output buffers

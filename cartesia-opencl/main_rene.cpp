@@ -2,6 +2,9 @@
 #include <fstream>
 #include <vector>
 #include <stdexcept>
+#include <cerrno>
+#include <cstring>
+#include <unistd.h>
 #include <CL/cl.h>
 
 #include "src/opencl_context.h"
@@ -17,6 +20,7 @@
 #include "src/weights.h"
 #include <cstdlib>
 #include <ctime>
+#include <cmath>
 
 using namespace cartesia_opencl;
 
@@ -70,13 +74,76 @@ std::vector<int32_t> readTokenFile(const std::string& filename) {
     return tokens;
 }
 
+// Helper: Check for NaN in buffer (debug)
+bool checkForNaN(cl_mem buffer, size_t size, cl_command_queue queue, const std::string& name) {
+    std::vector<float> data(size);
+    cl_int err = clEnqueueReadBuffer(queue, buffer, CL_TRUE, 0, size * sizeof(float), data.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        std::cerr << "  [NaN Check] Failed to read " << name << std::endl;
+        return false;
+    }
+    
+    int nan_count = 0, inf_count = 0;
+    float min_val = data[0], max_val = data[0];
+    for (float val : data) {
+        if (std::isnan(val)) nan_count++;
+        if (std::isinf(val)) inf_count++;
+        if (std::isfinite(val)) {
+            min_val = std::min(min_val, val);
+            max_val = std::max(max_val, val);
+        }
+    }
+    
+    if (nan_count > 0 || inf_count > 0) {
+        std::cout << "  [NaN Check] " << name << ": " << nan_count << " NaNs, " << inf_count << " Infs, "
+                  << "min=" << min_val << ", max=" << max_val << std::endl;
+        return true;
+    }
+    return false;
+}
+
+// Helper: Load weights from binary file
+std::vector<float> loadWeights(const std::string& filename) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open weight file: " + filename);
+    }
+    
+    // Read file size
+    file.seekg(0, std::ios::end);
+    size_t file_size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    
+    // Read weights (float32)
+    size_t num_weights = file_size / sizeof(float);
+    std::vector<float> weights(num_weights);
+    file.read(reinterpret_cast<char*>(weights.data()), file_size);
+    
+    if (!file) {
+        throw std::runtime_error("Failed to read weight file completely");
+    }
+    
+    std::cout << "  Loaded " << num_weights << " weights from " << filename << std::endl;
+    return weights;
+}
+
 // Helper: Write token IDs to binary file
 void writeTokenFile(const std::string& filename, const std::vector<int32_t>& tokens) {
     std::ofstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        throw std::runtime_error("Failed to open output file: " + std::string(filename));
+        char cwd[1024];
+        if (getcwd(cwd, sizeof(cwd)) != nullptr) {
+            std::cerr << "Current working directory: " << cwd << std::endl;
+        }
+        std::cerr << "Attempting to write to: " << filename << std::endl;
+        std::cerr << "errno: " << errno << " (" << strerror(errno) << ")" << std::endl;
+        throw std::runtime_error("Failed to open output file: " + filename);
     }
     file.write(reinterpret_cast<const char*>(tokens.data()), tokens.size() * sizeof(int32_t));
+    if (!file.good()) {
+        throw std::runtime_error("Failed to write to output file: " + filename);
+    }
+    file.close();
 }
 
 // Helper: Create token IDs buffer in OpenCL
@@ -104,37 +171,52 @@ int main(int argc, char* argv[]) {
         
         // Parse arguments
         if (argc < 2) {
-            std::cerr << "Usage: " << argv[0] << " <token_file.bin> [output_file.bin] [max_tokens] [n_layer_repeats]" << std::endl;
+            std::cerr << "Usage: " << argv[0] << " <token_file.bin> [weights_dir] [output_file.bin] [max_tokens]" << std::endl;
             std::cerr << "  token_file.bin: Input file with token IDs (int32 binary)" << std::endl;
-            std::cerr << "  output_file.bin: Output file for generated tokens (default: output_tokens.bin)" << std::endl;
+            std::cerr << "  weights_dir: Directory containing model weights (optional, generates random if not provided)" << std::endl;
+            std::cerr << "  output_file.bin: Output file for generated tokens (default: /data/local/tmp/output_tokens.bin)" << std::endl;
             std::cerr << "  max_tokens: Maximum tokens to generate (default: 3)" << std::endl;
-            std::cerr << "  n_layer_repeats: Number of layer repeats (1-" << N_LAYER_REPEATS 
-                      << ", default: " << N_LAYER_REPEATS << "). "
-                      << "Use 1 for testing to reduce memory usage." << std::endl;
             return 1;
         }
         
         std::string token_file = argv[1];
-        std::string output_file = (argc >= 3) ? argv[2] : "output_tokens.bin";
-        int max_tokens = (argc >= 4) ? std::stoi(argv[3]) : 3;
-        int n_layer_repeats = (argc >= 5) ? std::stoi(argv[4]) : N_LAYER_REPEATS;
+        std::string weights_dir = (argc >= 3) ? argv[2] : "";
+        std::string output_file = (argc >= 4) ? argv[3] : "/data/local/tmp/output_tokens.bin";
+        int max_tokens = (argc >= 5) ? std::stoi(argv[4]) : 3;
         
-        if (n_layer_repeats < 1 || n_layer_repeats > N_LAYER_REPEATS) {
-            std::cerr << "Warning: n_layer_repeats must be between 1 and " << N_LAYER_REPEATS 
-                      << ". Using " << N_LAYER_REPEATS << std::endl;
-            n_layer_repeats = N_LAYER_REPEATS;
+        bool use_pretrained_weights = !weights_dir.empty();
+        
+        // Use config from model_config.h (now set to Rene dimensions)
+        const int ACTUAL_VOCAB_SIZE = VOCAB_SIZE;  // 50288
+        const int ACTUAL_D_MODEL = D_MODEL;         // 2048
+        int n_layer_repeats = N_LAYER_REPEATS;      // 4
+        
+        if (use_pretrained_weights) {
+            std::cout << "Loading pretrained Rene weights from: " << weights_dir << std::endl;
+            std::cout << "Model config: vocab=" << ACTUAL_VOCAB_SIZE << ", d_model=" << ACTUAL_D_MODEL 
+                      << ", layers=" << (12 * n_layer_repeats) << std::endl;
+        } else {
+            std::cout << "Generating random weights for testing" << std::endl;
+            std::cout << "Model config: vocab=" << ACTUAL_VOCAB_SIZE << ", d_model=" << ACTUAL_D_MODEL 
+                      << ", layers=" << (12 * n_layer_repeats) << std::endl;
         }
         
         std::cout << "Using " << n_layer_repeats << " layer repeats (will create " 
                   << (12 * n_layer_repeats) << " layers)" << std::endl;
         
         // Initialize random seed for weight generation
-        std::srand(static_cast<unsigned>(std::time(nullptr)));
+        // Use fixed seed for reproducible weights (for MLX comparison)
+        std::srand(42);  // Fixed seed instead of time-based
         
         // Read input tokens
         std::cout << "Reading token file: " << token_file << std::endl;
         std::vector<int32_t> prompt_tokens = readTokenFile(token_file);
-        std::cout << "Loaded " << prompt_tokens.size() << " prompt tokens" << std::endl;
+        std::cout << "Loaded " << prompt_tokens.size() << " prompt tokens: [";
+        for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+            std::cout << prompt_tokens[i];
+            if (i < prompt_tokens.size() - 1) std::cout << ", ";
+        }
+        std::cout << "]" << std::endl;
         
         // Initialize OpenCL first (needed for vocab size check)
         std::cout << "Initializing OpenCL..." << std::endl;
@@ -142,31 +224,39 @@ int main(int argc, char* argv[]) {
         ctx_mgr.initialize();
         std::cout << "✓ OpenCL initialized" << std::endl;
         
-        // Clamp token IDs to valid test vocab range
-        constexpr int TEST_VOCAB_SIZE = 1000;  // Reduced for testing
+        // Clamp token IDs to valid vocab range
         for (int32_t& token_id : prompt_tokens) {
             if (token_id < 0) token_id = 0;
-            if (token_id >= TEST_VOCAB_SIZE) token_id = token_id % TEST_VOCAB_SIZE;
+            if (token_id >= ACTUAL_VOCAB_SIZE) token_id = token_id % ACTUAL_VOCAB_SIZE;
         }
-        std::cout << "Clamped token IDs to range [0, " << TEST_VOCAB_SIZE << ")" << std::endl;
+        std::cout << "Clamped token IDs to range [0, " << ACTUAL_VOCAB_SIZE << ")" << std::endl;
         
         cl_context context = ctx_mgr.getContext();
         cl_command_queue queue = ctx_mgr.getQueue();
         
         // Initialize model components
         std::cout << "Initializing model components..." << std::endl;
-        std::cout << "Using test vocab size: " << TEST_VOCAB_SIZE << " (full model: " << VOCAB_SIZE << ")" << std::endl;
         
         // Embedding layer
+        EmbeddingLayer embedding(&ctx_mgr, ACTUAL_VOCAB_SIZE, ACTUAL_D_MODEL);
+        std::vector<float> embedding_weights;
         
-        EmbeddingLayer embedding(&ctx_mgr, TEST_VOCAB_SIZE, D_MODEL);
-        // Initialize with small random weights for testing
-        std::vector<float> embedding_weights(TEST_VOCAB_SIZE * D_MODEL);
-        for (float& w : embedding_weights) {
-            w = 0.01f * (std::rand() % 200 - 100) / 100.0f;
+        if (use_pretrained_weights) {
+            std::cout << "Loading embedding weights..." << std::endl;
+            embedding_weights = loadWeights(weights_dir + "/embedding_weight.bin");
+            if (embedding_weights.size() != (size_t)(ACTUAL_VOCAB_SIZE * ACTUAL_D_MODEL)) {
+                throw std::runtime_error("Embedding weight size mismatch");
+            }
+        } else {
+            // Generate random weights for testing
+            embedding_weights.resize(ACTUAL_VOCAB_SIZE * ACTUAL_D_MODEL);
+            for (float& w : embedding_weights) {
+                w = 0.01f * (std::rand() % 200 - 100) / 100.0f;
+            }
         }
+        
         embedding.initializeWeights(embedding_weights);
-        std::cout << "✓ Embedding layer initialized (" << (TEST_VOCAB_SIZE * D_MODEL * sizeof(float) / 1024 / 1024) << " MB)" << std::endl;
+        std::cout << "✓ Embedding layer initialized (" << (ACTUAL_VOCAB_SIZE * ACTUAL_D_MODEL * sizeof(float) / 1024 / 1024) << " MB)" << std::endl;
         
         // Sequence model
         SequenceModel seq_model(&ctx_mgr, D_MODEL, n_layer_repeats, false);
@@ -188,8 +278,8 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        // Helper function to create SSD layer with default weights
-        auto createSSDLayer = [&](int expand, int kernel_size, int d_state, int d_head, int n_groups) -> SSDLayer* {
+        // Helper function to create SSD layer with weights (loaded or generated)
+        auto createSSDLayer = [&](int layer_idx, int expand, int kernel_size, int d_state, int d_head, int n_groups) -> SSDLayer* {
             SSDLayer* layer = new SSDLayer(&ctx_mgr, D_MODEL, expand, kernel_size, d_state, d_head, n_groups);
             
             int d_inner = D_MODEL * expand;
@@ -197,48 +287,73 @@ int main(int argc, char* argv[]) {
             int in_proj_dim = 2 * d_inner + 2 * d_state * n_groups + n_heads;
             int conv_dim = d_inner + 2 * d_state * n_groups;
             
-            // Initialize with small random-like weights for testing
-            std::vector<float> in_proj_weights(in_proj_dim * D_MODEL);
-            std::vector<float> conv_weight(conv_dim * kernel_size);
-            std::vector<float> conv_bias(conv_dim);
-            std::vector<float> A(n_heads);
-            std::vector<float> dt_bias(n_heads);
-            std::vector<float> D(n_heads);
-            std::vector<float> out_proj_weights(D_MODEL * d_inner);
+            std::vector<float> in_proj_weights, conv_weight, conv_bias, A, dt_bias, D, out_proj_weights;
             
-            // Fill with small values using fast deterministic pattern (instead of slow random)
-            for (size_t i = 0; i < in_proj_weights.size(); ++i) in_proj_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
-            for (size_t i = 0; i < conv_weight.size(); ++i) conv_weight[i] = 0.01f * ((i % 200) - 100) / 100.0f;
-            for (size_t i = 0; i < conv_bias.size(); ++i) conv_bias[i] = 0.001f * ((i % 200) - 100) / 100.0f;
-            for (size_t i = 0; i < A.size(); ++i) A[i] = 0.1f + 0.01f * (i % 100) / 100.0f;  // Positive values for A
-            for (float& dt : dt_bias) dt = 0.0f;
-            for (size_t i = 0; i < D.size(); ++i) D[i] = 0.1f * (i % 100) / 100.0f;
-            for (size_t i = 0; i < out_proj_weights.size(); ++i) out_proj_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
+            if (use_pretrained_weights) {
+                // Load weights from files
+                char layer_dir[256];
+                snprintf(layer_dir, sizeof(layer_dir), "%s/layer_%03d_ssd", weights_dir.c_str(), layer_idx);
+                in_proj_weights = loadWeights(std::string(layer_dir) + "/in_proj_weight.bin");
+                conv_weight = loadWeights(std::string(layer_dir) + "/conv_weight.bin");
+                conv_bias = loadWeights(std::string(layer_dir) + "/conv_bias.bin");
+                A = loadWeights(std::string(layer_dir) + "/A_log.bin");
+                dt_bias = loadWeights(std::string(layer_dir) + "/dt_bias.bin");
+                D = loadWeights(std::string(layer_dir) + "/D.bin");
+                out_proj_weights = loadWeights(std::string(layer_dir) + "/out_proj_weight.bin");
+            } else {
+                // Generate random weights
+                in_proj_weights.resize(in_proj_dim * D_MODEL);
+                conv_weight.resize(conv_dim * kernel_size);
+                conv_bias.resize(conv_dim);
+                A.resize(n_heads);
+                dt_bias.resize(n_heads);
+                D.resize(n_heads);
+                out_proj_weights.resize(D_MODEL * d_inner);
+                
+                for (size_t i = 0; i < in_proj_weights.size(); ++i) in_proj_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
+                for (size_t i = 0; i < conv_weight.size(); ++i) conv_weight[i] = 0.01f * ((i % 200) - 100) / 100.0f;
+                for (size_t i = 0; i < conv_bias.size(); ++i) conv_bias[i] = 0.001f * ((i % 200) - 100) / 100.0f;
+                for (size_t i = 0; i < A.size(); ++i) A[i] = 0.1f + 0.01f * (i % 100) / 100.0f;
+                for (float& dt : dt_bias) dt = 0.0f;
+                for (size_t i = 0; i < D.size(); ++i) D[i] = 0.1f * (i % 100) / 100.0f;
+                for (size_t i = 0; i < out_proj_weights.size(); ++i) out_proj_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
+            }
             
             layer->initializeWeights(in_proj_weights, conv_weight, conv_bias, A, dt_bias, D, out_proj_weights);
             return layer;
         };
         
-        // Helper function to create SwiGLU layer
-        auto createSwiGLULayer = [&](int expand) -> SwiGLULayer* {
+        // Helper function to create SwiGLU layer with weights (loaded or generated)
+        auto createSwiGLULayer = [&](int layer_idx, int expand) -> SwiGLULayer* {
             SwiGLULayer* layer = new SwiGLULayer(&ctx_mgr, D_MODEL, expand);
             
             int d_inner = D_MODEL * expand;
-            std::vector<float> gate_weights(d_inner * D_MODEL);
-            std::vector<float> up_weights(d_inner * D_MODEL);
-            std::vector<float> down_weights(D_MODEL * d_inner);
+            std::vector<float> gate_weights, up_weights, down_weights;
             
-            // Fast fill using deterministic pattern
-            for (size_t i = 0; i < gate_weights.size(); ++i) gate_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
-            for (size_t i = 0; i < up_weights.size(); ++i) up_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
-            for (size_t i = 0; i < down_weights.size(); ++i) down_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
+            if (use_pretrained_weights) {
+                // Load weights from files (MLX exports use "ffn" for SwiGLU)
+                char layer_dir[256];
+                snprintf(layer_dir, sizeof(layer_dir), "%s/layer_%03d", weights_dir.c_str(), layer_idx);
+                gate_weights = loadWeights(std::string(layer_dir) + "/gate_weight.bin");
+                up_weights = loadWeights(std::string(layer_dir) + "/up_weight.bin");
+                down_weights = loadWeights(std::string(layer_dir) + "/down_weight.bin");
+            } else {
+                // Generate random weights
+                gate_weights.resize(d_inner * D_MODEL);
+                up_weights.resize(d_inner * D_MODEL);
+                down_weights.resize(D_MODEL * d_inner);
+                
+                for (size_t i = 0; i < gate_weights.size(); ++i) gate_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
+                for (size_t i = 0; i < up_weights.size(); ++i) up_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
+                for (size_t i = 0; i < down_weights.size(); ++i) down_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
+            }
             
             layer->initializeWeights(gate_weights, up_weights, down_weights);
             return layer;
         };
         
-        // Helper function to create Attention layer
-        auto createAttentionLayer = [&]() -> AttentionLayer* {
+        // Helper function to create Attention layer with weights (loaded or generated)
+        auto createAttentionLayer = [&](int layer_idx) -> AttentionLayer* {
             std::cout << "\n    [createAttentionLayer] Creating AttentionLayer object..." << std::flush;
             AttentionLayer* layer = new AttentionLayer(
                 &ctx_mgr, D_MODEL, ATTENTION_N_HEADS, ATTENTION_N_HEADS, ATTENTION_HEAD_DIM, 4096, true
@@ -246,38 +361,36 @@ int main(int argc, char* argv[]) {
             std::cout << " ✓" << std::endl;
             
             int d_proj = (ATTENTION_N_HEADS + 2 * ATTENTION_N_HEADS) * ATTENTION_HEAD_DIM;
-            std::cout << "    [createAttentionLayer] Generating weights (d_proj=" << d_proj << ")..." << std::flush;
             size_t qkv_size = d_proj * D_MODEL;
             size_t out_size = D_MODEL * ATTENTION_N_HEADS * ATTENTION_HEAD_DIM;
-            std::cout << " (qkv: " << qkv_size << ", out: " << out_size << ")..." << std::flush;
-            std::cout.flush();
             
             std::vector<float> qkv_weights;
             std::vector<float> out_weights;
             
             try {
-                std::cout << "\n      Allocating qkv_weights (" << (qkv_size * sizeof(float) / 1024 / 1024) << " MB)..." << std::flush;
-                qkv_weights.resize(qkv_size);
-                std::cout << " ✓" << std::flush;
-                
-                std::cout << "\n      Filling qkv_weights (fast fill)..." << std::flush;
-                // Fast fill: use simple pattern instead of random for each element
-                for (size_t i = 0; i < qkv_weights.size(); ++i) {
-                    // Use a deterministic pattern based on index for speed
-                    qkv_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
+                if (use_pretrained_weights) {
+                    // Load weights from files
+                    char layer_dir[256];
+                    snprintf(layer_dir, sizeof(layer_dir), "%s/layer_%03d", weights_dir.c_str(), layer_idx);
+                    std::cout << "    [createAttentionLayer] Loading weights from " << layer_dir << "..." << std::flush;
+                    qkv_weights = loadWeights(std::string(layer_dir) + "/qkv_weight.bin");
+                    out_weights = loadWeights(std::string(layer_dir) + "/out_weight.bin");
+                    std::cout << " ✓" << std::endl;
+                } else {
+                    // Generate random weights
+                    std::cout << "    [createAttentionLayer] Generating weights (qkv: " << qkv_size << ", out: " << out_size << ")..." << std::flush;
+                    
+                    qkv_weights.resize(qkv_size);
+                    out_weights.resize(out_size);
+                    
+                    for (size_t i = 0; i < qkv_weights.size(); ++i) {
+                        qkv_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
+                    }
+                    for (size_t i = 0; i < out_weights.size(); ++i) {
+                        out_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
+                    }
+                    std::cout << " ✓" << std::endl;
                 }
-                std::cout << " ✓" << std::flush;
-                
-                std::cout << "\n      Allocating out_weights (" << (out_size * sizeof(float) / 1024 / 1024) << " MB)..." << std::flush;
-                out_weights.resize(out_size);
-                std::cout << " ✓" << std::flush;
-                
-                std::cout << "\n      Filling out_weights (fast fill)..." << std::flush;
-                // Fast fill: use simple pattern instead of random
-                for (size_t i = 0; i < out_weights.size(); ++i) {
-                    out_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
-                }
-                std::cout << " ✓" << std::endl;
             } catch (const std::bad_alloc& e) {
                 std::cerr << "\n    FATAL: Out of memory allocating attention weights!" << std::endl;
                 std::cerr << "    qkv_weights size: " << qkv_size << " floats (" << (qkv_size * sizeof(float) / 1024 / 1024) << " MB)" << std::endl;
@@ -305,7 +418,7 @@ int main(int argc, char* argv[]) {
             std::cout << "  Repeat " << (repeat + 1) << " of " << n_layer_repeats << "..." << std::endl;
             // Layer 0: SSD
             {
-                SSDLayer* layer = createSSDLayer(SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
+                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
                 ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, D_MODEL, "pre", true);
                 seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
                 layer_count++;
@@ -313,7 +426,7 @@ int main(int argc, char* argv[]) {
             
             // Layer 1: SSD
             {
-                SSDLayer* layer = createSSDLayer(SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
+                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
                 ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, D_MODEL, "pre", true);
                 seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
                 layer_count++;
@@ -321,7 +434,7 @@ int main(int argc, char* argv[]) {
             
             // Layer 2: SwiGLU
             {
-                SwiGLULayer* layer = createSwiGLULayer(SSD_EXPAND);
+                SwiGLULayer* layer = createSwiGLULayer(layer_count, SSD_EXPAND);
                 ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, D_MODEL, "pre", false);
                 seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
                 layer_count++;
@@ -329,7 +442,7 @@ int main(int argc, char* argv[]) {
             
             // Layer 3: SSD
             {
-                SSDLayer* layer = createSSDLayer(SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
+                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
                 ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, D_MODEL, "pre", true);
                 seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
                 layer_count++;
@@ -337,7 +450,7 @@ int main(int argc, char* argv[]) {
             
             // Layer 4: SSD
             {
-                SSDLayer* layer = createSSDLayer(SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
+                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
                 ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, D_MODEL, "pre", true);
                 seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
                 layer_count++;
@@ -345,7 +458,7 @@ int main(int argc, char* argv[]) {
             
             // Layer 5: SwiGLU
             {
-                SwiGLULayer* layer = createSwiGLULayer(SSD_EXPAND);
+                SwiGLULayer* layer = createSwiGLULayer(layer_count, SSD_EXPAND);
                 ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, D_MODEL, "pre", false);
                 seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
                 layer_count++;
@@ -355,7 +468,7 @@ int main(int argc, char* argv[]) {
             {
                 std::cout << "  Creating Attention layer " << layer_count << "..." << std::flush;
                 try {
-                    AttentionLayer* layer = createAttentionLayer();
+                    AttentionLayer* layer = createAttentionLayer(layer_count);
                     std::cout << " ✓" << std::endl;
                     std::cout << "  Creating ResidualBlock for Attention..." << std::flush;
                     ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, D_MODEL, "pre", true);
@@ -372,7 +485,7 @@ int main(int argc, char* argv[]) {
             
             // Layer 7: SSD
             {
-                SSDLayer* layer = createSSDLayer(SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
+                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
                 ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, D_MODEL, "pre", true);
                 seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
                 layer_count++;
@@ -380,7 +493,7 @@ int main(int argc, char* argv[]) {
             
             // Layer 8: SwiGLU
             {
-                SwiGLULayer* layer = createSwiGLULayer(SSD_EXPAND);
+                SwiGLULayer* layer = createSwiGLULayer(layer_count, SSD_EXPAND);
                 ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, D_MODEL, "pre", false);
                 seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
                 layer_count++;
@@ -388,7 +501,7 @@ int main(int argc, char* argv[]) {
             
             // Layer 9: SSD
             {
-                SSDLayer* layer = createSSDLayer(SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
+                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
                 ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, D_MODEL, "pre", true);
                 seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
                 layer_count++;
@@ -396,7 +509,7 @@ int main(int argc, char* argv[]) {
             
             // Layer 10: SSD
             {
-                SSDLayer* layer = createSSDLayer(SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
+                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
                 ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, D_MODEL, "pre", true);
                 seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
                 layer_count++;
@@ -404,7 +517,7 @@ int main(int argc, char* argv[]) {
             
             // Layer 11: SwiGLU
             {
-                SwiGLULayer* layer = createSwiGLULayer(SSD_EXPAND);
+                SwiGLULayer* layer = createSwiGLULayer(layer_count, SSD_EXPAND);
                 ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, D_MODEL, "pre", false);
                 seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
                 layer_count++;
@@ -419,20 +532,31 @@ int main(int argc, char* argv[]) {
         std::cout << "✓ Built full model with " << layer_count << " layers" << std::endl;
         std::cout.flush();
         
-        // LM Head - use same reduced vocab size for testing
+        // LM Head
         std::cout << "Initializing LM Head..." << std::flush;
-        LMHead lm_head(&ctx_mgr, D_MODEL, TEST_VOCAB_SIZE);
+        LMHead lm_head(&ctx_mgr, D_MODEL, ACTUAL_VOCAB_SIZE);
         std::cout << " ✓ (created)" << std::endl;
-        std::cout << "  Creating LM Head weights..." << std::flush;
-        std::vector<float> lm_weights(TEST_VOCAB_SIZE * D_MODEL);
-        for (float& w : lm_weights) {
-            w = 0.01f * (std::rand() % 200 - 100) / 100.0f;
+        
+        std::vector<float> lm_weights;
+        if (use_pretrained_weights) {
+            std::cout << "  Loading LM Head weights..." << std::flush;
+            lm_weights = loadWeights(weights_dir + "/lm_head_weight.bin");
+            if (lm_weights.size() != (size_t)(ACTUAL_VOCAB_SIZE * D_MODEL)) {
+                throw std::runtime_error("LM head weight size mismatch");
+            }
+        } else {
+            std::cout << "  Generating LM Head weights..." << std::flush;
+            lm_weights.resize(ACTUAL_VOCAB_SIZE * D_MODEL);
+            for (float& w : lm_weights) {
+                w = 0.01f * (std::rand() % 200 - 100) / 100.0f;
+            }
         }
-        std::cout << " ✓ (generated " << lm_weights.size() << " weights)" << std::endl;
-        std::cout << "  Initializing LM Head weights..." << std::flush;
+        std::cout << " ✓ (" << lm_weights.size() << " weights)" << std::endl;
+        
+        std::cout << "  Initializing LM Head..." << std::flush;
         lm_head.initializeWeights(lm_weights);
         std::cout << " ✓" << std::endl;
-        std::cout << "✓ LM Head initialized (" << (TEST_VOCAB_SIZE * D_MODEL * sizeof(float) / 1024 / 1024) << " MB)" << std::endl;
+        std::cout << "✓ LM Head initialized (" << (ACTUAL_VOCAB_SIZE * D_MODEL * sizeof(float) / 1024 / 1024) << " MB)" << std::endl;
         
         // Sampler
         Sampler sampler;
@@ -452,6 +576,24 @@ int main(int argc, char* argv[]) {
         cl_mem embeddings = embedding.encode(token_buffer, batch_size, seq_len, queue);
         std::cout << " ✓" << std::endl;
         
+        // Check embedding output for NaN
+        static bool checked_embedding = false;
+        if (!checked_embedding) {
+            size_t emb_size = batch_size * seq_len * ACTUAL_D_MODEL;
+            std::vector<float> emb_check(emb_size);
+            cl_int check_err = clEnqueueReadBuffer(queue, embeddings, CL_TRUE, 0,
+                emb_size * sizeof(float), emb_check.data(), 0, nullptr, nullptr);
+            if (check_err == CL_SUCCESS) {
+                int nan_count = 0;
+                for (float val : emb_check) {
+                    if (std::isnan(val)) { nan_count++; }
+                }
+                std::cout << "  [Embedding Debug] Embedding output: " << nan_count 
+                          << " NaNs out of " << emb_size << " values" << std::endl;
+            }
+            checked_embedding = true;
+        }
+        
     // Forward through sequence model
     std::cout << "  Step 2: Forward pass through " << seq_model.getNumLayers() << " layers..." << std::flush;
     std::vector<LayerState> states;  // Will be populated by stateful layers
@@ -467,8 +609,8 @@ int main(int argc, char* argv[]) {
     std::cout << " ✓" << std::endl;
     
     // Extract logits for the last token in the sequence
-    // The LM head now outputs [batch_size * seq_len, vocab_size] = [7, 1000]
-    std::vector<float> all_logits(effective_batch_size * TEST_VOCAB_SIZE);
+    // The LM head outputs [batch_size * seq_len, vocab_size]
+    std::vector<float> all_logits(effective_batch_size * ACTUAL_VOCAB_SIZE);
     cl_int err = clEnqueueReadBuffer(queue, prefill_logits, CL_TRUE, 0, 
                                      all_logits.size() * sizeof(float), 
                                      all_logits.data(), 0, nullptr, nullptr);
@@ -477,9 +619,9 @@ int main(int argc, char* argv[]) {
     }
     
     // Get last token's logits (last position in the effective batch)
-    size_t last_token_offset = (seq_len - 1) * TEST_VOCAB_SIZE;
+    size_t last_token_offset = (seq_len - 1) * ACTUAL_VOCAB_SIZE;
     std::vector<float> last_token_logits(all_logits.begin() + last_token_offset, 
-                                         all_logits.begin() + last_token_offset + TEST_VOCAB_SIZE);
+                                         all_logits.begin() + last_token_offset + ACTUAL_VOCAB_SIZE);
     
     // Sample first token from prefill logits
     std::cout << "  Step 4: Sampling first token from prefill logits..." << std::flush;
@@ -512,12 +654,22 @@ int main(int argc, char* argv[]) {
                 current_embedding = embedding.encodeStep(current_token_buf, batch_size, queue);
                 if (!current_embedding) throw std::runtime_error("encodeStep returned null buffer");
                 std::cout << "  [Gen] EncodeStep ✓" << std::endl;
+                
+                // Check embedding for NaN (first iteration only)
+                if (i == 0) {
+                    checkForNaN(current_embedding, batch_size * ACTUAL_D_MODEL, queue, "embedding_output");
+                }
                 std::cout.flush();
                 
                 // Step through sequence model
                 next_hidden = seq_model.step(current_embedding, batch_size, &states, queue);
                 if (!next_hidden) throw std::runtime_error("seq_model.step returned null buffer");
                 std::cout << "  [Gen] seq_model.step ✓" << std::endl;
+                
+                // Check hidden state for NaN (first iteration only)
+                if (i == 0) {
+                    checkForNaN(next_hidden, batch_size * ACTUAL_D_MODEL, queue, "hidden_state");
+                }
                 std::cout.flush();
                 
                 // Get logits from LM head
@@ -531,9 +683,9 @@ int main(int argc, char* argv[]) {
                 std::cout << "  [Gen] clFinish ✓" << std::endl;
                 std::cout.flush();
                 
-                // Sample next token (use TEST_VOCAB_SIZE)
+                // Sample next token
                 int next_token = sampler.sampleFromBuffer(
-                    logits, TEST_VOCAB_SIZE, queue,
+                    logits, ACTUAL_VOCAB_SIZE, queue,
                     DEFAULT_TOP_P, DEFAULT_TEMPERATURE
                 );
                 std::cout << "  [Gen] sample ✓ -> token=" << next_token << std::endl;
@@ -541,8 +693,8 @@ int main(int argc, char* argv[]) {
                 std::cout.flush();
                 
                 // Clamp token ID to valid range
-                if (next_token >= TEST_VOCAB_SIZE) {
-                    next_token = next_token % TEST_VOCAB_SIZE;
+                if (next_token >= ACTUAL_VOCAB_SIZE) {
+                    next_token = next_token % ACTUAL_VOCAB_SIZE;
                 }
                 
                 generated_tokens.push_back(next_token);
@@ -593,7 +745,12 @@ int main(int argc, char* argv[]) {
         
         std::cout << std::endl;
         std::cout << "Generation complete!" << std::endl;
-        std::cout << "Generated " << generated_tokens.size() << " tokens" << std::endl;
+        std::cout << "Generated " << generated_tokens.size() << " tokens: [";
+        for (size_t i = 0; i < generated_tokens.size(); ++i) {
+            std::cout << generated_tokens[i];
+            if (i < generated_tokens.size() - 1) std::cout << ", ";
+        }
+        std::cout << "]" << std::endl;
         
         // Write output (even if partially generated)
         if (!generated_tokens.empty()) {

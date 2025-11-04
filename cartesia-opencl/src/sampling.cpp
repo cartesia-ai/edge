@@ -5,10 +5,11 @@
 #include <CL/cl.h>
 #include <vector>
 #include <random>
+#include <iostream>
 
 namespace cartesia_opencl {
 
-Sampler::Sampler() : rng_(std::random_device{}()) {}
+Sampler::Sampler() : rng_(42) {}  // Use fixed seed for deterministic comparison with MLX
 
 std::vector<float> Sampler::softmax(const std::vector<float>& logits, float temperature) {
     std::vector<float> probs(logits.size());
@@ -43,17 +44,51 @@ int Sampler::sampleFromProbs(const std::vector<float>& probs) {
         }
     }
     
-    // Fallback (shouldn't happen)
-    return static_cast<int>(probs.size() - 1);
+    // Fallback: if cumsum didn't reach r due to floating point errors,
+    // find the token with highest probability instead of always returning the last token
+    size_t max_idx = 0;
+    float max_prob = probs[0];
+    for (size_t i = 1; i < probs.size(); ++i) {
+        if (probs[i] > max_prob) {
+            max_prob = probs[i];
+            max_idx = i;
+        }
+    }
+    return static_cast<int>(max_idx);
 }
 
 int Sampler::categoricalSample(const std::vector<float>& logits, float temperature) {
-    auto probs = softmax(logits, temperature);
+    // Clip logits to prevent numerical instability
+    std::vector<float> clipped_logits = logits;
+    const float MAX_LOGIT = 50.0f;
+    const float MIN_LOGIT = -50.0f;
+    for (float& l : clipped_logits) {
+        if (std::isnan(l) || std::isinf(l)) {
+            l = 0.0f;
+        } else {
+            l = std::max(MIN_LOGIT, std::min(MAX_LOGIT, l));
+        }
+    }
+    
+    auto probs = softmax(clipped_logits, temperature);
     return sampleFromProbs(probs);
 }
 
 int Sampler::topPSample(const std::vector<float>& logits, float top_p, float temperature) {
-    auto probs = softmax(logits, temperature);
+    // Clip logits to prevent numerical instability
+    // MLX/numpy typically handle this better, so we clip to reasonable range
+    std::vector<float> clipped_logits = logits;
+    const float MAX_LOGIT = 50.0f;  // Clamp to reasonable range for numerical stability
+    const float MIN_LOGIT = -50.0f;
+    for (float& l : clipped_logits) {
+        if (std::isnan(l) || std::isinf(l)) {
+            l = 0.0f;  // Replace NaN/Inf with 0
+        } else {
+            l = std::max(MIN_LOGIT, std::min(MAX_LOGIT, l));
+        }
+    }
+    
+    auto probs = softmax(clipped_logits, temperature);
     
     // Create indices and sort by probability (descending)
     std::vector<size_t> indices(probs.size());
@@ -63,6 +98,7 @@ int Sampler::topPSample(const std::vector<float>& logits, float top_p, float tem
     });
     
     // Find top-p cumulative probability
+    // Ensure at least one token is selected (cutoff >= 1)
     float cumsum = 0.0f;
     size_t cutoff = 0;
     for (size_t i = 0; i < indices.size(); ++i) {
@@ -73,6 +109,11 @@ int Sampler::topPSample(const std::vector<float>& logits, float top_p, float tem
         }
     }
     
+    // Ensure at least one token is selected
+    if (cutoff == 0) {
+        cutoff = 1;
+    }
+    
     // Renormalize probabilities for top-p tokens
     float sum_top_p = 0.0f;
     std::vector<float> filtered_probs(probs.size(), 0.0f);
@@ -81,9 +122,18 @@ int Sampler::topPSample(const std::vector<float>& logits, float top_p, float tem
         sum_top_p += probs[indices[i]];
     }
     
-    // Renormalize
-    for (float& p : filtered_probs) {
-        p /= sum_top_p;
+    // Safety check: if sum is zero or very small, use uniform distribution over selected tokens
+    if (sum_top_p < 1e-10f) {
+        // This shouldn't happen, but if it does, use uniform over top tokens
+        float uniform_prob = 1.0f / cutoff;
+        for (size_t i = 0; i < cutoff; ++i) {
+            filtered_probs[indices[i]] = uniform_prob;
+        }
+    } else {
+        // Renormalize
+        for (float& p : filtered_probs) {
+            p /= sum_top_p;
+        }
     }
     
     return sampleFromProbs(filtered_probs);
@@ -106,6 +156,26 @@ int Sampler::sampleFromBuffer(
     
     if (err != CL_SUCCESS) {
         throw std::runtime_error("Failed to read logits from buffer");
+    }
+    
+    // Debug: Check logits statistics (first time only)
+    static bool first_sample = true;
+    if (first_sample) {
+        float min_logit = logits[0], max_logit = logits[0], sum_logit = 0.0f;
+        for (float l : logits) {
+            min_logit = std::min(min_logit, l);
+            max_logit = std::max(max_logit, l);
+            sum_logit += l;
+        }
+        float mean_logit = sum_logit / logits.size();
+        std::cout << "  [Sampling Debug] logits: min=" << min_logit 
+                  << ", max=" << max_logit << ", mean=" << mean_logit << std::endl;
+        std::cout << "  [Sampling Debug] first 10 logits: ";
+        for (int i = 0; i < 10 && i < vocab_size; ++i) {
+            std::cout << logits[i] << " ";
+        }
+        std::cout << std::endl;
+        first_sample = false;
     }
     
     // Sample

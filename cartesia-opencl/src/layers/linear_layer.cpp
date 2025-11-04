@@ -29,13 +29,13 @@ LinearLayer::LinearLayer(OpenCLContextManager* ctx, int input_dim, int output_di
     // Debug output
     size_t num_params = static_cast<size_t>(output_dim) * input_dim;
     size_t buffer_size_mb = (num_params * sizeof(float)) / (1024 * 1024);
-    std::cout << "  [Linear] input_dim=" << input_dim 
-              << ", output_dim=" << output_dim 
-              << ", params=" << num_params;
-    if (has_bias) {
-        std::cout << " (with bias: +" << output_dim << " params)";
-    }
-    std::cout << ", buffer_size=" << buffer_size_mb << " MB" << std::endl;
+    // std::cout << "  [Linear] input_dim=" << input_dim 
+    //           << ", output_dim=" << output_dim 
+    //           << ", params=" << num_params;
+    // if (has_bias) {
+    //     std::cout << " (with bias: +" << output_dim << " params)";
+    // }
+    // std::cout << ", buffer_size=" << buffer_size_mb << " MB" << std::endl;
     
     buildKernels();
 }
@@ -72,13 +72,46 @@ __kernel void matmul(
     if (batch_idx >= batch_size || row >= m || col >= n) return;
     
     float sum = 0.0f;
+    const float max_val = 1e10f;  // Prevent overflow
+    const float min_val = -1e10f;
+    
     for (int i = 0; i < k; ++i) {
         int a_idx = batch_idx * m * k + row * k + i;
         int b_idx = i * n + col;
-        sum += A[a_idx] * B[b_idx];
+        
+        float a_val = A[a_idx];
+        float b_val = B[b_idx];
+        
+        // Clamp to prevent Inf/NaN and overflow
+        if (isnan(a_val) || isinf(a_val)) a_val = 0.0f;
+        if (isnan(b_val) || isinf(b_val)) b_val = 0.0f;
+        if (a_val > max_val) a_val = max_val;
+        if (a_val < min_val) a_val = min_val;
+        if (b_val > max_val) b_val = max_val;
+        if (b_val < min_val) b_val = min_val;
+        
+        float product = a_val * b_val;
+        // Clamp product to prevent sum overflow
+        if (product > max_val) product = max_val;
+        if (product < min_val) product = min_val;
+        
+        sum += product;
+        
+        // Clamp sum periodically to prevent accumulation overflow
+        if (sum > max_val) sum = max_val;
+        if (sum < min_val) sum = min_val;
     }
     
     int c_idx = batch_idx * m * n + row * n + col;
+    
+    // Final clamp before writing
+    if (isnan(sum) || isinf(sum)) {
+        sum = 0.0f;
+    } else {
+        if (sum > max_val) sum = max_val;
+        if (sum < min_val) sum = min_val;
+    }
+    
     C[c_idx] = sum;
 }
 
@@ -95,8 +128,39 @@ __kernel void matvec(
     if (row >= m) return;
     
     float sum = 0.0f;
+    const float max_val = 1e10f;  // Prevent overflow
+    const float min_val = -1e10f;
+    
     for (int i = 0; i < n; ++i) {
-        sum += A[row * n + i] * x[i];
+        float a_val = A[row * n + i];
+        float x_val = x[i];
+        
+        // Clamp to prevent Inf/NaN and overflow
+        if (isnan(a_val) || isinf(a_val)) a_val = 0.0f;
+        if (isnan(x_val) || isinf(x_val)) x_val = 0.0f;
+        if (a_val > max_val) a_val = max_val;
+        if (a_val < min_val) a_val = min_val;
+        if (x_val > max_val) x_val = max_val;
+        if (x_val < min_val) x_val = min_val;
+        
+        float product = a_val * x_val;
+        // Clamp product to prevent sum overflow
+        if (product > max_val) product = max_val;
+        if (product < min_val) product = min_val;
+        
+        sum += product;
+        
+        // Clamp sum periodically to prevent accumulation overflow
+        if (sum > max_val) sum = max_val;
+        if (sum < min_val) sum = min_val;
+    }
+    
+    // Final clamp before writing
+    if (isnan(sum) || isinf(sum)) {
+        sum = 0.0f;
+    } else {
+        if (sum > max_val) sum = max_val;
+        if (sum < min_val) sum = min_val;
     }
     
     y[row] = sum;
@@ -125,11 +189,23 @@ void LinearLayer::initializeWeights(const std::vector<float>& weights, const std
         }
     }
     
+    // Transpose weights: MLX exports as (output_dim, input_dim) but OpenCL kernel expects [input_dim, output_dim]
+    // The matmul kernel does: b_idx = i * output_dim + col where i is input_dim
+    // So B is stored as [input_dim, output_dim]
+    std::vector<float> transposed_weights(input_dim_ * output_dim_);
+    for (int i = 0; i < input_dim_; ++i) {
+        for (int j = 0; j < output_dim_; ++j) {
+            // MLX format: weights[j * input_dim_ + i] is element at (output_dim=j, input_dim=i)
+            // OpenCL format: transposed_weights[i * output_dim_ + j] should be element at (input_dim=i, output_dim=j)
+            transposed_weights[i * output_dim_ + j] = weights[j * input_dim_ + i];
+        }
+    }
+    
     cl_context context = ctx_->getContext();
     cl_int err;
     
     // Check device capabilities before creating buffer
-    size_t buffer_size = weights.size() * sizeof(float);
+    size_t buffer_size = transposed_weights.size() * sizeof(float);
     cl_device_id device = ctx_->getDevice();
     
     // Get device memory info
@@ -163,7 +239,7 @@ void LinearLayer::initializeWeights(const std::vector<float>& weights, const std
         context,
         CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         buffer_size,
-        (void*)weights.data(),
+        (void*)transposed_weights.data(),
         &err
     );
     

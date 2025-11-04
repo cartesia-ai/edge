@@ -91,14 +91,14 @@ cl_program OpenCLContextManager::buildProgram(const std::vector<std::string>& so
         std::vector<unsigned char> binary;
         
         if (loadProgramBinary(cache_filename, binary)) {
-            std::cout << "\n      Loading program binary from cache..." << std::flush;
+            // std::cout << "\n      Loading program binary from cache..." << std::flush;
             try {
                 cl_program program = createProgramFromBinary(binary);
                 // Some vendors require a finalize step, but most binaries work immediately
                 // Try to build anyway (will succeed immediately for valid binaries)
                 cl_int err = clBuildProgram(program, 1, &device_, nullptr, nullptr, nullptr);
                 if (err == CL_SUCCESS) {
-                    std::cout << " ✓ (loaded from cache, " << (binary.size() / 1024) << " KB)" << std::flush;
+                    // std::cout << " ✓ (loaded from cache, " << (binary.size() / 1024) << " KB)" << std::flush;
                     return program;
                 } else {
                     // Binary is invalid (e.g., driver updated), fall through to rebuild

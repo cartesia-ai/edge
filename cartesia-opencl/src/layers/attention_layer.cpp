@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <CL/cl.h>
 #include <cmath>
+#include <vector>
 
 namespace cartesia_opencl {
 
@@ -480,6 +481,100 @@ cl_mem AttentionLayer::forward(
         throw std::runtime_error("Attention weights not initialized");
     }
     
+    // Debug: Check input IMMEDIATELY on entry (first time only)
+    static bool checked_input_entry = false;
+    static void* last_buffer_ptr = nullptr;
+    if (!checked_input_entry) {
+        size_t input_size = batch_size * seq_len * d_model_;
+        size_t buf_size = 0;
+        cl_int info_err = clGetMemObjectInfo(input, CL_MEM_SIZE, sizeof(size_t), &buf_size, nullptr);
+        
+        // Check if this is the same buffer pointer as before
+        if (input == last_buffer_ptr && last_buffer_ptr != nullptr) {
+            std::cout << "  [Attention Entry Debug] Same buffer pointer as before!" << std::endl;
+        } else {
+            if (last_buffer_ptr != nullptr) {
+                std::cout << "  [Attention Entry Debug] WARNING: Buffer pointer changed! "
+                          << "Previous=" << last_buffer_ptr << ", Current=" << input << std::endl;
+            } else {
+                std::cout << "  [Attention Entry Debug] First check (storing pointer)" << std::endl;
+            }
+            last_buffer_ptr = input;
+        }
+        
+        // Get buffer info to compare addresses
+        cl_uint buffer_mem_type = 0;
+        clGetMemObjectInfo(input, CL_MEM_TYPE, sizeof(cl_uint), &buffer_mem_type, nullptr);
+        std::cout << "  [Attention Entry Debug] Buffer type=" << buffer_mem_type 
+                  << " (CL_MEM_OBJECT_BUFFER=" << CL_MEM_OBJECT_BUFFER << ")" << std::endl;
+        
+        std::vector<float> input_check(input_size);
+        cl_int check_err = clEnqueueReadBuffer(queue, input, CL_TRUE, 0,
+            input_size * sizeof(float), input_check.data(), 0, nullptr, nullptr);
+        if (check_err == CL_SUCCESS) {
+            int nan_count = 0;
+            // Check which token positions have NaN
+            std::vector<int> nan_per_token(seq_len, 0);
+            for (size_t i = 0; i < input_check.size(); ++i) {
+                if (std::isnan(input_check[i])) {
+                    nan_count++;
+                    int token_idx = i / d_model_;
+                    if (token_idx < seq_len) {
+                        nan_per_token[token_idx]++;
+                    }
+                }
+            }
+            
+            // Check first few values of token 5 (the clean one) vs token 0 (NaN)
+            std::cout << "  [Attention Entry Debug] Input at function entry: " << nan_count 
+                      << " NaNs out of " << input_size << " values, buffer_size=" << buf_size << std::endl;
+            std::cout << "  [Attention Entry Debug] NaNs per token: ";
+            for (int i = 0; i < seq_len; ++i) {
+                std::cout << "token" << i << "=" << nan_per_token[i] << "/" << d_model_ << " ";
+            }
+            std::cout << std::endl;
+            
+            // Show sample values from token 0 and token 5
+            std::cout << "  [Attention Entry Debug] Token 0 first 5 values: ";
+            for (int i = 0; i < 5; ++i) {
+                std::cout << input_check[i] << " ";
+            }
+            std::cout << std::endl;
+            std::cout << "  [Attention Entry Debug] Token 5 first 5 values: ";
+            for (int i = 5 * d_model_; i < 5 * d_model_ + 5; ++i) {
+                std::cout << input_check[i] << " ";
+            }
+            std::cout << std::endl;
+            
+            // If these values match what ResidualBlock saw, then it's the same buffer content
+            // This will help diagnose if the buffer was corrupted or if we're reading from wrong place
+            bool token5_matches = true;
+            for (int i = 5 * d_model_; i < 5 * d_model_ + 5; ++i) {
+                if (std::isnan(input_check[i])) {
+                    token5_matches = false;
+                    break;
+                }
+            }
+            std::cout << "  [Attention Entry Debug] Token 5 is " 
+                      << (token5_matches ? "VALID (non-NaN)" : "CORRUPTED (has NaN)") << std::endl;
+            
+            // Check if token 5 matches what we expect (should be the same as ResidualBlock saw)
+            // This will help us understand if the buffer content actually changed or if it's a read issue
+            bool token5_all_nan_in_attention = true;
+            for (int i = 5 * d_model_; i < 5 * d_model_ + d_model_; ++i) {
+                if (!std::isnan(input_check[i])) {
+                    token5_all_nan_in_attention = false;
+                    break;
+                }
+            }
+            std::cout << "  [Attention Entry Debug] Token 5 is " 
+                      << (token5_all_nan_in_attention ? "ALL NaN" : "has valid values") << std::endl;
+        } else {
+            std::cout << "  [Attention Entry Debug] Failed to read buffer, err=" << check_err << std::endl;
+        }
+        checked_input_entry = true;
+    }
+    
     // Optional runtime override to force CPU fallback regardless of kernel build state
     if (const char* force_cpu = std::getenv("FORCE_ATTENTION_CPU")) {
         if (std::string(force_cpu) == "1") {
@@ -552,12 +647,48 @@ cl_mem AttentionLayer::forward(
         attn_output_flat_size_ = q_size;
     }
     
+    // Debug: Check input for NaN (first time only)
+    static bool checked_input = false;
+    if (!checked_input) {
+        size_t input_size = batch_size * seq_len * d_model_;
+        std::vector<float> input_check(input_size);
+        cl_int check_err = clEnqueueReadBuffer(queue, input, CL_TRUE, 0,
+            input_size * sizeof(float), input_check.data(), 0, nullptr, nullptr);
+        if (check_err == CL_SUCCESS) {
+            int nan_count = 0;
+            for (float val : input_check) {
+                if (std::isnan(val)) { nan_count++; }
+            }
+            std::cout << "  [Attention Input Debug] Input to attention: " << nan_count 
+                      << " NaNs out of " << input_size << " values" << std::endl;
+        }
+        checked_input = true;
+    }
+    
     // Step 1: QKV projection
     qkv_layer_->forward(input, batch_size, seq_len, queue);  // Output stored internally
     
     // Copy output to our buffer (TODO: avoid this copy by getting buffer from LinearLayer)
     // For now, assume LinearLayer returns the buffer
     cl_mem qkv_out = qkv_layer_->forward(input, batch_size, seq_len, queue);
+    
+    // Debug: Check QKV output for NaN (first time only)
+    static bool checked_qkv = false;
+    if (!checked_qkv) {
+        size_t qkv_size = batch_size * seq_len * d_proj_;
+        std::vector<float> qkv_check(qkv_size);
+        cl_int check_err = clEnqueueReadBuffer(queue, qkv_out, CL_TRUE, 0,
+            qkv_size * sizeof(float), qkv_check.data(), 0, nullptr, nullptr);
+        if (check_err == CL_SUCCESS) {
+            int nan_count = 0;
+            for (float val : qkv_check) {
+                if (std::isnan(val)) { nan_count++; }
+            }
+            std::cout << "  [Attention QKV Debug] QKV output: " << nan_count 
+                      << " NaNs out of " << qkv_size << " values" << std::endl;
+        }
+        checked_qkv = true;
+    }
     
     // Step 2: Split QKV
     err = clSetKernelArg(split_qkv_kernel_, 0, sizeof(cl_mem), &qkv_out);
@@ -682,6 +813,24 @@ cl_mem AttentionLayer::forward(
     } else {
         // Initialize state
         if (state) {
+            // Debug: Check if keys have NaN before storing in cache (first time only)
+            static bool checked_prefill_keys = false;
+            if (!checked_prefill_keys) {
+                size_t keys_size = batch_size * kv_heads_ * seq_len * d_head_;
+                std::vector<float> keys_check(keys_size);
+                cl_int check_err = clEnqueueReadBuffer(queue, keys_reshaped_, CL_TRUE, 0,
+                    keys_size * sizeof(float), keys_check.data(), 0, nullptr, nullptr);
+                if (check_err == CL_SUCCESS) {
+                    int nan_count = 0;
+                    for (float val : keys_check) {
+                        if (std::isnan(val)) { nan_count++; }
+                    }
+                    std::cout << "\n  [Attention Prefill Debug] Keys before caching: " << nan_count 
+                              << " NaNs out of " << keys_size << " values" << std::endl;
+                }
+                checked_prefill_keys = true;
+            }
+            
             retainAndAssign(state->state1, keys_reshaped_);
             retainAndAssign(state->state2, values_reshaped_);
             // state3 unused for now
@@ -955,7 +1104,46 @@ cl_mem AttentionLayer::step(
     
     if (state && !state->is_null() && state->state1 && state->state2) {
         // Concatenate with proper cached length tracking
-        int cached_len = cached_kv_len_ > 0 ? cached_kv_len_ : 1;
+        int cached_len = cached_kv_len_;
+        
+        // Debug: Always print cache info (first time only)
+        static bool printed_cache_info = false;
+        if (!printed_cache_info) {
+            std::cout << "\n  [Attention Debug] cached_kv_len_=" << cached_kv_len_ << std::endl;
+            
+            if (cached_len <= 0) {
+                // Infer cached length from state buffer size
+                size_t state1_size = 0;
+                clGetMemObjectInfo(state->state1, CL_MEM_SIZE, sizeof(size_t), &state1_size, nullptr);
+                cached_len = state1_size / (batch_size * kv_heads_ * d_head_ * sizeof(float));
+                std::cout << "  [Attention Debug] Inferred cached_len=" << cached_len 
+                          << " (buffer=" << state1_size << " bytes, batch=" << batch_size 
+                          << ", kv_heads=" << kv_heads_ << ", d_head=" << d_head_ << ")" << std::endl;
+            }
+            
+            // Check if cached keys contain NaN
+            size_t state1_size = 0;
+            clGetMemObjectInfo(state->state1, CL_MEM_SIZE, sizeof(size_t), &state1_size, nullptr);
+            int check_len = state1_size / (batch_size * kv_heads_ * d_head_ * sizeof(float));
+            std::vector<float> cached_keys_check(check_len * batch_size * kv_heads_ * d_head_);
+            cl_int check_err = clEnqueueReadBuffer(queue, state->state1, CL_TRUE, 0, 
+                cached_keys_check.size() * sizeof(float), cached_keys_check.data(), 0, nullptr, nullptr);
+            if (check_err == CL_SUCCESS) {
+                int nan_count = 0;
+                for (float val : cached_keys_check) {
+                    if (std::isnan(val)) { nan_count++; }
+                }
+                std::cout << "  [Attention Debug] Cached keys: " << nan_count << " NaNs out of " 
+                          << cached_keys_check.size() << " values (actual_len=" << check_len << ")" << std::endl;
+            }
+            
+            printed_cache_info = true;
+        } else if (cached_len <= 0) {
+            // Infer cached length from state buffer size (when debug already printed)
+            size_t state1_size = 0;
+            clGetMemObjectInfo(state->state1, CL_MEM_SIZE, sizeof(size_t), &state1_size, nullptr);
+            cached_len = state1_size / (batch_size * kv_heads_ * d_head_ * sizeof(float));
+        }
         int total_len = cached_len + seq_len;
         size_t concat_bytes = (size_t)batch_size * kv_heads_ * total_len * d_head_ * sizeof(float);
         

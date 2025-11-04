@@ -59,20 +59,20 @@ SSDLayer::SSDLayer(
     size_t ssm_params = n_heads_ + n_heads_ + n_heads_;  // A, dt_bias, D
     size_t total_params = in_proj_params + conv_params + out_proj_params + ssm_params + conv_dim_; // + conv_bias
     size_t buffer_size_mb = (total_params * sizeof(float)) / (1024 * 1024);
-    std::cout << "  [SSD] d_model=" << d_model_
-              << ", expand=" << (d_inner_ / d_model_)
-              << ", d_inner=" << d_inner_
-              << ", kernel_size=" << kernel_size_
-              << ", d_state=" << d_state_
-              << ", d_head=" << d_head_
-              << ", n_heads=" << n_heads_
-              << ", n_groups=" << n_groups_
-              << ", in_proj_dim=" << in_proj_dim_
-              << ", conv_dim=" << conv_dim_
-              << ", params=" << total_params
-              << " (in_proj:" << in_proj_params << ", conv:" << conv_params 
-              << ", out_proj:" << out_proj_params << ", ssm:" << ssm_params << ")"
-              << ", buffer_size=" << buffer_size_mb << " MB" << std::endl;
+    // std::cout << "  [SSD] d_model=" << d_model_
+    //           << ", expand=" << (d_inner_ / d_model_)
+    //           << ", d_inner=" << d_inner_
+    //           << ", kernel_size=" << kernel_size_
+    //           << ", d_state=" << d_state_
+    //           << ", d_head=" << d_head_
+    //           << ", n_heads=" << n_heads_
+    //           << ", n_groups=" << n_groups_
+    //           << ", in_proj_dim=" << in_proj_dim_
+    //           << ", conv_dim=" << conv_dim_
+    //           << ", params=" << total_params
+    //           << " (in_proj:" << in_proj_params << ", conv:" << conv_params 
+    //           << ", out_proj:" << out_proj_params << ", ssm:" << ssm_params << ")"
+    //           << ", buffer_size=" << buffer_size_mb << " MB" << std::endl;
     
     // Create linear layers
     in_proj_layer_ = std::make_unique<LinearLayer>(ctx_, d_model_, in_proj_dim_, false);

@@ -5,6 +5,8 @@
 #include <CL/cl.h>
 #include <cstring>
 #include <vector>
+#include <iostream>
+#include <cmath>
 
 namespace cartesia_opencl {
 
@@ -52,9 +54,98 @@ cl_mem ResidualBlock::forward(
     // Pre-norm
     if (!norm_point_.empty() && norm_point_ == "pre") {
         input = applyNorm(input, batch_size, seq_len, queue);
+        
+        // Debug: Check pre-norm output (for layer 6 attention only)
+        static bool checked_layer6_prenorm = false;
+        if (!checked_layer6_prenorm && layer_ && layer_->isStateful()) {
+            // This is likely the attention layer (only stateful layer)
+            clFinish(queue);  // Ensure norm completes
+            
+            // Retain the buffer to prevent it from being released
+            clRetainMemObject(input);
+            
+            size_t input_size = batch_size * seq_len * d_model_;
+            std::vector<float> prenorm_check(input_size);
+            size_t buf_size = 0;
+            cl_int info_err = clGetMemObjectInfo(input, CL_MEM_SIZE, sizeof(size_t), &buf_size, nullptr);
+            
+            if (info_err == CL_SUCCESS && buf_size >= input_size * sizeof(float)) {
+                cl_int check_err = clEnqueueReadBuffer(queue, input, CL_TRUE, 0,
+                    input_size * sizeof(float), prenorm_check.data(), 0, nullptr, nullptr);
+                if (check_err == CL_SUCCESS) {
+                    int nan_count = 0;
+                    int inf_count = 0;
+                    std::vector<int> nan_per_token(seq_len, 0);
+                    for (size_t i = 0; i < prenorm_check.size(); ++i) {
+                        if (std::isnan(prenorm_check[i])) {
+                            nan_count++;
+                            int token_idx = i / d_model_;
+                            if (token_idx < seq_len) {
+                                nan_per_token[token_idx]++;
+                            }
+                        }
+                        if (std::isinf(prenorm_check[i])) {
+                            inf_count++;
+                        }
+                    }
+                    std::cout << "  [ResidualBlock PreNorm Debug] After pre-norm: " << nan_count 
+                              << " NaNs, " << inf_count << " Infs out of " << input_size << " values, buffer_size=" << buf_size << std::endl;
+                    std::cout << "  [ResidualBlock PreNorm Debug] NaNs per token: ";
+                    for (int i = 0; i < seq_len; ++i) {
+                        std::cout << "token" << i << "=" << nan_per_token[i] << "/" << d_model_ << " ";
+                    }
+                    std::cout << std::endl;
+                }
+            }
+            checked_layer6_prenorm = true;
+        }
     }
     
     // Apply layer
+    // Ensure all previous operations complete before passing input to layer
+    clFinish(queue);
+    
+    // Debug: Check input right before calling layer forward (for attention layer)
+    static bool checked_before_forward = false;
+    static std::vector<float> saved_buffer_data;
+    static void* saved_buffer_ptr = nullptr;
+    if (!checked_before_forward && layer_ && layer_->isStateful()) {
+        size_t input_size = batch_size * seq_len * d_model_;
+        std::vector<float> before_forward_check(input_size);
+        size_t buf_size = 0;
+        clGetMemObjectInfo(input, CL_MEM_SIZE, sizeof(size_t), &buf_size, nullptr);
+        cl_int check_err = clEnqueueReadBuffer(queue, input, CL_TRUE, 0,
+            input_size * sizeof(float), before_forward_check.data(), 0, nullptr, nullptr);
+        if (check_err == CL_SUCCESS) {
+            int nan_count = 0;
+            for (float val : before_forward_check) {
+                if (std::isnan(val)) { nan_count++; }
+            }
+            std::cout << "  [ResidualBlock BeforeForward] Input right before layer->forward(): " 
+                      << nan_count << " NaNs out of " << input_size << " values" << std::endl;
+            
+            // Save buffer data and pointer for comparison
+            saved_buffer_data = before_forward_check;
+            saved_buffer_ptr = input;
+            
+            // Print token 5 values to compare later
+            std::cout << "  [ResidualBlock BeforeForward] Saved token 5 first 5 values: ";
+            for (int i = 5 * d_model_; i < 5 * d_model_ + 5; ++i) {
+                std::cout << before_forward_check[i] << " ";
+            }
+            std::cout << std::endl;
+        }
+        checked_before_forward = true;
+    }
+    
+    // If we saved buffer data, check if the pointer is still the same when we call forward
+    if (checked_before_forward && layer_ && layer_->isStateful() && input == saved_buffer_ptr) {
+        std::cout << "  [ResidualBlock] About to call layer->forward() with SAME buffer pointer" << std::endl;
+    } else if (checked_before_forward && layer_ && layer_->isStateful() && input != saved_buffer_ptr) {
+        std::cout << "  [ResidualBlock] WARNING: Buffer pointer changed! Was=" << saved_buffer_ptr 
+                  << ", Now=" << input << std::endl;
+    }
+    
     cl_mem output;
     if (stateful_) {
         output = layer_->forward(input, batch_size, seq_len, state, queue);

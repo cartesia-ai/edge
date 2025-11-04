@@ -17,7 +17,9 @@ public:
     ~LinearLayer();
     
     // Initialize weights
-    // Weights: [output_dim, input_dim] (row-major)
+    // Input weights: [output_dim, input_dim] (MLX export format, row-major)
+    // Internal storage: [input_dim, output_dim] (transposed for OpenCL kernel)
+    // The matmul kernel expects B[i * output_dim + col] where i=input_dim
     // Bias: [output_dim] (optional)
     void initializeWeights(const std::vector<float>& weights, const std::vector<float>& bias = {});
     

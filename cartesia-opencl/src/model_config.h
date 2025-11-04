@@ -2,15 +2,15 @@
 
 namespace cartesia_opencl {
 
-// Test model configuration (Mamba2-130M size)
-// Optimized for Android devices with limited memory
-// To use full Rene (d_model=2048), change back and rebuild
+// Rene model configuration (Rene-v0.1-1.3b)
+// REDUCED for Android device memory constraints (1.3 GB total GPU memory)
+// Full model (d_model=2048, 48 layers) needs ~5-6 GB
 
-// Model dimensions - REDUCED FOR TESTING
-constexpr int D_MODEL = 768;            // Was 2048 (Mamba2-130M: fits in device memory)
-constexpr int VOCAB_SIZE = 50288;       // Vocabulary size (padded to multiple of 16)
-constexpr int N_LAYER = 24;             // Was 48 (Mamba2-130M)
-constexpr int N_LAYER_REPEATS = 1;      // Was 4 (for testing)
+// Model dimensions - REDUCED FOR DEVICE MEMORY
+constexpr int D_MODEL = 1024;           // Reduced from 2048 (1/4 memory per layer)
+constexpr int VOCAB_SIZE = 50288;       // Vocabulary size (padded to multiple of 16, Rene uses 50280)
+constexpr int N_LAYER = 12;             // Reduced from 48 layers
+constexpr int N_LAYER_REPEATS = 1;      // 1 repeat (12 unique layers, no repeats)
 constexpr int N_UNIQUE_LAYERS = 12;     // Number of unique layer configurations
 
 // Layer type indices (0-based, for the 12 unique layers)
@@ -39,9 +39,9 @@ constexpr int SSD_D_STATE = 64;         // State dimension
 constexpr int SSD_D_HEAD = 64;          // Head dimension
 constexpr int SSD_N_GROUPS = 1;         // Number of groups
 
-// Attention layer defaults - adjusted for d_model=768
-constexpr int ATTENTION_N_HEADS = 12;   // Number of attention heads (768/64=12)
-constexpr int ATTENTION_HEAD_DIM = 64;  // Head dimension (was 128)
+// Attention layer defaults - Reduced for device memory
+constexpr int ATTENTION_N_HEADS = 8;    // Reduced from 16 (1024/128=8)
+constexpr int ATTENTION_HEAD_DIM = 128;  // Head dimension
 
 // RMS Norm epsilon
 constexpr float RMS_NORM_EPS = 1e-6f;
