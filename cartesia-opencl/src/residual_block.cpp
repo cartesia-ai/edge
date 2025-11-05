@@ -160,6 +160,30 @@ cl_mem ResidualBlock::forward(
     }
     
     // Residual connection: output = output + residual
+    // IMPORTANT: Check if output and residual are the same buffer - if so, we need to create a new buffer
+    // This can happen if a layer returns its input buffer without modification
+    cl_int err;
+    cl_mem residual_buffer = residual;
+    cl_mem output_buffer = output;
+    
+    // Check if output == residual (same buffer pointer)
+    if (output_buffer == residual_buffer) {
+        // Layer returned input unchanged - create new buffer for output
+        cl_context context = ctx_->getContext();
+        size_t output_size = batch_size * seq_len * d_model_ * sizeof(float);
+        output_buffer = clCreateBuffer(context, CL_MEM_READ_WRITE, output_size, nullptr, &err);
+        if (err != CL_SUCCESS || !output_buffer) {
+            throw std::runtime_error("Failed to create new output buffer for residual connection");
+        }
+        // Copy input to output (since layer didn't modify it)
+        err = clEnqueueCopyBuffer(queue, residual_buffer, output_buffer, 0, 0, output_size, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            clReleaseMemObject(output_buffer);
+            throw std::runtime_error("Failed to copy buffer for residual connection");
+        }
+        clFinish(queue);
+    }
+    
     // Allocate temporary buffer for residual addition
     size_t output_size = batch_size * seq_len * d_model_ * sizeof(float);
     
@@ -168,14 +192,17 @@ cl_mem ResidualBlock::forward(
     std::vector<float> output_cpu(batch_size * seq_len * d_model_);
     std::vector<float> residual_cpu(batch_size * seq_len * d_model_);
     
-    clEnqueueReadBuffer(queue, output, CL_TRUE, 0, output_size, output_cpu.data(), 0, nullptr, nullptr);
-    clEnqueueReadBuffer(queue, residual, CL_TRUE, 0, output_size, residual_cpu.data(), 0, nullptr, nullptr);
+    clEnqueueReadBuffer(queue, output_buffer, CL_TRUE, 0, output_size, output_cpu.data(), 0, nullptr, nullptr);
+    clEnqueueReadBuffer(queue, residual_buffer, CL_TRUE, 0, output_size, residual_cpu.data(), 0, nullptr, nullptr);
     
     for (size_t i = 0; i < output_cpu.size(); ++i) {
         output_cpu[i] += residual_cpu[i];
     }
     
-    clEnqueueWriteBuffer(queue, output, CL_TRUE, 0, output_size, output_cpu.data(), 0, nullptr, nullptr);
+    clEnqueueWriteBuffer(queue, output_buffer, CL_TRUE, 0, output_size, output_cpu.data(), 0, nullptr, nullptr);
+    
+    // Update output to point to the correct buffer
+    output = output_buffer;
     
     // Post-norm
     if (!norm_point_.empty() && norm_point_ == "post") {
@@ -248,6 +275,19 @@ cl_mem ResidualBlock::applyNormStep(cl_mem input, int batch_size, cl_command_que
         return input;  // No normalization
     }
     return norm_layer_->step(input, batch_size, queue);
+}
+
+void ResidualBlock::setNormWeights(const std::vector<float>& weights) {
+    if (!norm_layer_) {
+        return;  // No norm layer, nothing to set
+    }
+    if (weights.size() != static_cast<size_t>(d_model_)) {
+        throw std::runtime_error("Norm weights size mismatch: expected " + 
+                                std::to_string(d_model_) + ", got " + 
+                                std::to_string(weights.size()));
+    }
+    norm_weights_ = weights;
+    norm_layer_->initializeWeights(norm_weights_);
 }
 
 } // namespace cartesia_opencl

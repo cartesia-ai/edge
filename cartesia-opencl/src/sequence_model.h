@@ -32,7 +32,8 @@ public:
         int batch_size,
         int seq_len,
         std::vector<LayerState>* state,
-        cl_command_queue queue
+        cl_command_queue queue,
+        const std::string& output_prefix = ""
     );
     
     // Step function - processes single token

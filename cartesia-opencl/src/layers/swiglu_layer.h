@@ -2,6 +2,7 @@
 
 #include "../residual_block.h"
 #include "linear_layer.h"
+#include "rms_norm_layer.h"
 #include <CL/cl.h>
 #include <memory>
 
@@ -9,6 +10,7 @@ namespace cartesia_opencl {
 
 class OpenCLContextManager;
 class LinearLayer;
+class RMSNormLayer;
 
 /**
  * SwiGLU (Swish-Gated Linear Unit) feedforward layer.
@@ -59,6 +61,9 @@ private:
     std::unique_ptr<LinearLayer> gate_layer_;
     std::unique_ptr<LinearLayer> up_layer_;
     std::unique_ptr<LinearLayer> down_layer_;
+    
+    // RMS norm layer (applied after GLU combine, before out_proj)
+    std::unique_ptr<RMSNormLayer> norm_layer_;
     
     // Swish kernel
     cl_program program_;

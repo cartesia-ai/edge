@@ -495,7 +495,7 @@ __kernel void compute_ssm_output_kernel(
         }
         
         std::cout << "[SSDLayer] Building OpenCL program with " << sources.size() << " source(s)..." << std::flush;
-        program_ = ctx_mgr.buildProgram(sources, cache_key);
+    program_ = ctx_mgr.buildProgram(sources, cache_key);
         std::cout << " ✓" << std::endl;
         
         // Verify program was created
@@ -545,21 +545,21 @@ __kernel void compute_ssm_output_kernel(
         
         // Create kernels one at a time to isolate any driver crashes
         std::cout << "\n  [SSDLayer] Creating conv_forward_kernel..." << std::flush;
-        conv_forward_kernel_ = ctx_mgr.getKernel(program_, "conv1d_forward_kernel");
+    conv_forward_kernel_ = ctx_mgr.getKernel(program_, "conv1d_forward_kernel");
         if (!conv_forward_kernel_) {
             throw std::runtime_error("Failed to create conv_forward_kernel (returned null)");
         }
         std::cout << " ✓" << std::flush;
         
         std::cout << "\n  [SSDLayer] Creating conv_update_kernel..." << std::flush;
-        conv_update_kernel_ = ctx_mgr.getKernel(program_, "conv1d_update_kernel");
+    conv_update_kernel_ = ctx_mgr.getKernel(program_, "conv1d_update_kernel");
         if (!conv_update_kernel_) {
             throw std::runtime_error("Failed to create conv_update_kernel (returned null)");
         }
         std::cout << " ✓" << std::flush;
         
         std::cout << "\n  [SSDLayer] Creating ssm_kernel..." << std::flush;
-        ssm_kernel_ = ctx_mgr.getKernel(program_, "ssm_update_kernel");
+    ssm_kernel_ = ctx_mgr.getKernel(program_, "ssm_update_kernel");
         if (!ssm_kernel_) {
             throw std::runtime_error("Failed to create ssm_kernel (returned null)");
         }
@@ -679,6 +679,8 @@ void SSDLayer::initializeWeights(
     if (in_proj_weights.size() != static_cast<size_t>(in_proj_dim_ * d_model_)) {
         throw std::runtime_error("Invalid in_proj weights size");
     }
+    // conv_weight has conv_dim channels (d_inner + 2*d_state*n_groups), not xBC_channels
+    // MLX conv1d processes only the first conv_dim channels of xBC
     if (conv_weight.size() != static_cast<size_t>(conv_dim_ * kernel_size_)) {
         throw std::runtime_error("Invalid conv_weight size");
     }
@@ -710,6 +712,30 @@ void SSDLayer::initializeWeights(
     cl_context context = ctx_->getContext();
     cl_int err;
     
+    // Debug: Check weights before creating buffer (only first layer)
+    static int weight_init_debug = 0;
+    weight_init_debug++;
+    if (weight_init_debug == 1) {
+        float w_min = conv_weight[0], w_max = conv_weight[0], w_sum = 0.0f;
+        for (size_t i = 0; i < std::min(conv_weight.size(), size_t(1000)); ++i) {
+            w_min = std::min(w_min, conv_weight[i]);
+            w_max = std::max(w_max, conv_weight[i]);
+            w_sum += conv_weight[i];
+        }
+        float b_min = conv_bias[0], b_max = conv_bias[0], b_sum = 0.0f;
+        for (size_t i = 0; i < std::min(conv_bias.size(), size_t(100)); ++i) {
+            b_min = std::min(b_min, conv_bias[i]);
+            b_max = std::max(b_max, conv_bias[i]);
+            b_sum += conv_bias[i];
+        }
+        std::cout << "[Weight Init Debug] conv_weight before buffer: min=" << w_min << ", max=" << w_max 
+                  << ", mean=" << (w_sum / std::min(conv_weight.size(), size_t(1000))) << std::endl;
+        std::cout << "[Weight Init Debug] conv_bias before buffer: min=" << b_min << ", max=" << b_max 
+                  << ", mean=" << (b_sum / std::min(conv_bias.size(), size_t(100))) << std::endl;
+        std::cout << "[Weight Init Debug] First few conv_weight values: " << conv_weight[0] << " " 
+                  << conv_weight[1] << " " << conv_weight[2] << " " << conv_weight[3] << std::endl;
+    }
+    
     conv_weight_ = clCreateBuffer(
         context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         conv_weight.size() * sizeof(float), (void*)conv_weight.data(), &err
@@ -721,6 +747,23 @@ void SSDLayer::initializeWeights(
         conv_bias.size() * sizeof(float), (void*)conv_bias.data(), &err
     );
     if (err != CL_SUCCESS) throw std::runtime_error("Failed to create conv_bias buffer");
+    
+    // Debug: Verify buffer was created correctly by reading back immediately
+    if (weight_init_debug == 1) {
+        cl_command_queue queue = ctx_->getQueue();
+        std::vector<float> verify_weight(conv_weight.size());
+        std::vector<float> verify_bias(conv_bias.size());
+        clEnqueueReadBuffer(queue, conv_weight_, CL_TRUE, 0, 
+                           conv_weight.size() * sizeof(float), verify_weight.data(), 0, nullptr, nullptr);
+        clEnqueueReadBuffer(queue, conv_bias_, CL_TRUE, 0, 
+                           conv_bias.size() * sizeof(float), verify_bias.data(), 0, nullptr, nullptr);
+        std::cout << "[Weight Init Debug] conv_weight after buffer creation: first=" << verify_weight[0] 
+                  << ", second=" << verify_weight[1] << ", matches=" 
+                  << (std::abs(verify_weight[0] - conv_weight[0]) < 1e-5f) << std::endl;
+        std::cout << "[Weight Init Debug] conv_bias after buffer creation: first=" << verify_bias[0] 
+                  << ", second=" << verify_bias[1] << ", matches=" 
+                  << (std::abs(verify_bias[0] - conv_bias[0]) < 1e-5f) << std::endl;
+    }
     
     A_ = clCreateBuffer(
         context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
@@ -845,15 +888,36 @@ cl_mem SSDLayer::forward(
     splitInProjOutput(in_proj_out, batch_size, seq_len, z_buf, xBC_buf, dt_buf, queue);
     clFinish(queue);
     
+    // Debug: Check xBC after split (before conv1d)
+    static int split_debug_count = 0;
+    split_debug_count++;
+    if (split_debug_count == 1) {
+        std::vector<float> xBC_check(xBC_size);
+        clEnqueueReadBuffer(queue, xBC_buf, CL_TRUE, 0, 
+                           xBC_size * sizeof(float), xBC_check.data(), 0, nullptr, nullptr);
+        float xBC_check_min = xBC_check[0], xBC_check_max = xBC_check[0], xBC_check_sum = 0.0f;
+        for (size_t i = 0; i < std::min(xBC_size, size_t(1000)); ++i) {
+            xBC_check_min = std::min(xBC_check_min, xBC_check[i]);
+            xBC_check_max = std::max(xBC_check_max, xBC_check[i]);
+            xBC_check_sum += xBC_check[i];
+        }
+        std::cout << "[Split Debug] xBC after split (before conv1d): min=" << xBC_check_min 
+                  << ", max=" << xBC_check_max << ", mean=" << (xBC_check_sum / std::min(xBC_size, size_t(1000))) << std::endl;
+        std::cout << "[Split Debug] First few xBC values: " << xBC_check[0] << " " << xBC_check[1] 
+                  << " " << xBC_check[2] << " " << xBC_check[3] << " " << xBC_check[4] << std::endl;
+    }
+    
     // Step 3: conv1d on xBC with Swish activation
-    // xBC is [batch, seq_len, conv_dim], need to reshape to [batch, conv_dim, seq_len] for conv
-    // Use CPU fallback for now
+    // xBC is [batch, seq_len, xBC_channels] where xBC_channels = 2*d_inner + 2*d_state*n_groups
+    // BUT: MLX conv1d processes only the first conv_dim channels (d_inner + 2*d_state*n_groups)
+    // The remaining channels pass through unchanged
     // Read xBC from the already-split buffer
+    int xBC_channels = 2 * d_inner_ + 2 * d_state_ * n_groups_;
     std::vector<float> xBC_cpu(xBC_size);
     clEnqueueReadBuffer(queue, xBC_buf, CL_TRUE, 0, 
                        xBC_size * sizeof(float), xBC_cpu.data(), 0, nullptr, nullptr);
     
-    // Read conv weights and bias
+    // Read conv weights and bias (only conv_dim channels, not all xBC_channels)
     std::vector<float> conv_weight_cpu(conv_dim_ * kernel_size_);
     std::vector<float> conv_bias_cpu(conv_dim_);
     clEnqueueReadBuffer(queue, conv_weight_, CL_TRUE, 0, 
@@ -861,25 +925,113 @@ cl_mem SSDLayer::forward(
     clEnqueueReadBuffer(queue, conv_bias_, CL_TRUE, 0, 
                        conv_bias_cpu.size() * sizeof(float), conv_bias_cpu.data(), 0, nullptr, nullptr);
     
-    // Apply conv1d: xBC is [batch, seq_len, conv_dim], reshape to [batch, conv_dim, seq_len] for conv
-    // Then apply conv1d with Swish, result back to [batch, seq_len, conv_dim]
+    // Apply conv1d: process only first conv_dim channels, rest pass through unchanged
+    // Debug: Check input and weights before conv1d (only once)
+    static int conv1d_debug_count = 0;
+    conv1d_debug_count++;
+    if (conv1d_debug_count == 1) {
+        float xBC_min = xBC_cpu[0], xBC_max = xBC_cpu[0], xBC_sum = 0.0f;
+        for (size_t i = 0; i < std::min(xBC_size, size_t(1000)); ++i) {
+            xBC_min = std::min(xBC_min, xBC_cpu[i]);
+            xBC_max = std::max(xBC_max, xBC_cpu[i]);
+            xBC_sum += xBC_cpu[i];
+        }
+        float w_min = conv_weight_cpu[0], w_max = conv_weight_cpu[0], w_sum = 0.0f;
+        for (size_t i = 0; i < std::min(size_t(conv_dim_ * kernel_size_), size_t(1000)); ++i) {
+            w_min = std::min(w_min, conv_weight_cpu[i]);
+            w_max = std::max(w_max, conv_weight_cpu[i]);
+            w_sum += conv_weight_cpu[i];
+        }
+        float b_min = conv_bias_cpu[0], b_max = conv_bias_cpu[0], b_sum = 0.0f;
+        for (size_t i = 0; i < std::min(size_t(conv_dim_), size_t(100)); ++i) {
+            b_min = std::min(b_min, conv_bias_cpu[i]);
+            b_max = std::max(b_max, conv_bias_cpu[i]);
+            b_sum += conv_bias_cpu[i];
+        }
+        std::cout << "[Conv1d Debug] Input xBC stats: min=" << xBC_min << ", max=" << xBC_max 
+                  << ", mean=" << (xBC_sum / std::min(xBC_size, size_t(1000))) << std::endl;
+        std::cout << "[Conv1d Debug] Weights stats: min=" << w_min << ", max=" << w_max 
+                  << ", mean=" << (w_sum / std::min(size_t(conv_dim_ * kernel_size_), size_t(1000))) << std::endl;
+        std::cout << "[Conv1d Debug] Bias stats: min=" << b_min << ", max=" << b_max 
+                  << ", mean=" << (b_sum / std::min(size_t(conv_dim_), size_t(100))) << std::endl;
+        std::cout << "[Conv1d Debug] First few xBC values: " << xBC_cpu[0] << " " << xBC_cpu[1] 
+                  << " " << xBC_cpu[2] << " " << xBC_cpu[3] << " " << xBC_cpu[4] << std::endl;
+        std::cout << "[Conv1d Debug] First few weights: " << conv_weight_cpu[0] << " " 
+                  << conv_weight_cpu[1] << " " << conv_weight_cpu[2] << " " << conv_weight_cpu[3] << std::endl;
+    }
+    
     std::vector<float> xBC_conv_cpu(xBC_size);
+    // Initialize output to zeros
+    std::fill(xBC_conv_cpu.begin(), xBC_conv_cpu.end(), 0.0f);
+    
     for (int b = 0; b < batch_size; ++b) {
-        for (int c = 0; c < conv_dim_; ++c) {
-            for (int s = 0; s < seq_len; ++s) {
+        for (int s = 0; s < seq_len; ++s) {
+            int base_idx = b * seq_len * xBC_channels + s * xBC_channels;
+            
+            // Process first conv_dim channels with conv1d
+            for (int c = 0; c < conv_dim_; ++c) {
                 float sum = 0.0f;
-                for (int k = 0; k < kernel_size_ && s + k < seq_len; ++k) {
-                    int xBC_idx = b * seq_len * conv_dim_ + (s + k) * conv_dim_ + c;
-                    int w_idx = c * kernel_size_ + k;
-                    sum += conv_weight_cpu[w_idx] * xBC_cpu[xBC_idx];
+                // Only compute if we have enough sequence length for the kernel
+                if (s + kernel_size_ <= seq_len) {
+                    for (int k = 0; k < kernel_size_; ++k) {
+                        // xBC_cpu layout: [batch, seq_len, channels]
+                        // For position s in sequence, channel c, we need input at position (s+k), channel c
+                        int xBC_idx = (b * seq_len + s + k) * xBC_channels + c;
+                        // Weight layout: [channels, kernel_size]
+                        int w_idx = c * kernel_size_ + k;
+                        sum += conv_weight_cpu[w_idx] * xBC_cpu[xBC_idx];
+                    }
                 }
                 sum += conv_bias_cpu[c];
-                // Swish activation
+                // Swish activation: x * sigmoid(x)
                 float sigmoid = 1.0f / (1.0f + expf(-sum));
                 sum = sum * sigmoid;
-                xBC_conv_cpu[b * seq_len * conv_dim_ + s * conv_dim_ + c] = sum;
+                xBC_conv_cpu[base_idx + c] = sum;
+            }
+            
+            // Pass through remaining channels unchanged
+            for (int c = conv_dim_; c < xBC_channels; ++c) {
+                xBC_conv_cpu[base_idx + c] = xBC_cpu[base_idx + c];
             }
         }
+    }
+    
+    // Debug: Check a specific computation (only once)
+    if (conv1d_debug_count == 1) {
+        // Check first position computation
+        int test_b = 0, test_s = 0, test_c = 0;
+        int test_base = test_b * seq_len * xBC_channels + test_s * xBC_channels;
+        float test_sum = 0.0f;
+        if (test_s + kernel_size_ <= seq_len) {
+            for (int k = 0; k < kernel_size_; ++k) {
+                int test_xBC_idx = (test_b * seq_len + test_s + k) * xBC_channels + test_c;
+                int test_w_idx = test_c * kernel_size_ + k;
+                test_sum += conv_weight_cpu[test_w_idx] * xBC_cpu[test_xBC_idx];
+                std::cout << "[Conv1d Debug] k=" << k << ", xBC_idx=" << test_xBC_idx 
+                          << ", xBC_val=" << xBC_cpu[test_xBC_idx] << ", w_idx=" << test_w_idx 
+                          << ", w_val=" << conv_weight_cpu[test_w_idx] << ", partial_sum=" << test_sum << std::endl;
+            }
+        }
+        test_sum += conv_bias_cpu[test_c];
+        std::cout << "[Conv1d Debug] After bias: sum=" << test_sum << ", bias=" << conv_bias_cpu[test_c] << std::endl;
+        float test_sigmoid = 1.0f / (1.0f + expf(-test_sum));
+        test_sum = test_sum * test_sigmoid;
+        std::cout << "[Conv1d Debug] Final output[0]=" << test_sum << ", expected=" << xBC_conv_cpu[0] << std::endl;
+    }
+    
+    // Debug: Check conv1d output (only once)
+    if (conv1d_debug_count == 1) {
+        float out_min = xBC_conv_cpu[0], out_max = xBC_conv_cpu[0], out_sum = 0.0f;
+        for (size_t i = 0; i < std::min(xBC_size, size_t(1000)); ++i) {
+            out_min = std::min(out_min, xBC_conv_cpu[i]);
+            out_max = std::max(out_max, xBC_conv_cpu[i]);
+            out_sum += xBC_conv_cpu[i];
+        }
+        std::cout << "[Conv1d Debug] Output stats: min=" << out_min << ", max=" << out_max 
+                  << ", mean=" << (out_sum / std::min(xBC_size, size_t(1000))) << std::endl;
+        std::cout << "[Conv1d Debug] First few output values: " << xBC_conv_cpu[0] << " " 
+                  << xBC_conv_cpu[1] << " " << xBC_conv_cpu[2] << " " << xBC_conv_cpu[3] 
+                  << " " << xBC_conv_cpu[4] << std::endl;
     }
     
     // Write xBC_conv back to GPU
@@ -888,10 +1040,26 @@ cl_mem SSDLayer::forward(
     clFinish(queue);
     
     // Step 4: Split xBC into x, B, C
-    // Read xBC_conv
+    // Read xBC_conv from GPU
     std::vector<float> xBC_conv_read(xBC_size);
     clEnqueueReadBuffer(queue, xBC_buf, CL_TRUE, 0, 
                        xBC_size * sizeof(float), xBC_conv_read.data(), 0, nullptr, nullptr);
+    
+    // Debug: Verify the read matches what we wrote (only once)
+    if (conv1d_debug_count == 1) {
+        bool match = true;
+        for (size_t i = 0; i < std::min(xBC_size, size_t(100)); ++i) {
+            if (std::abs(xBC_conv_read[i] - xBC_conv_cpu[i]) > 1e-5f) {
+                match = false;
+                std::cout << "[Conv1d Debug] Mismatch at index " << i << ": wrote=" << xBC_conv_cpu[i] 
+                          << ", read=" << xBC_conv_read[i] << std::endl;
+                break;
+            }
+        }
+        if (match) {
+            std::cout << "[Conv1d Debug] Write/read verification: First 100 values match ✓" << std::endl;
+        }
+    }
     
     // Allocate buffers for x, B, C
     // After conv, xBC is split at [d_inner, d_inner + d_state*n_groups]
@@ -911,13 +1079,14 @@ cl_mem SSDLayer::forward(
     
     // Split: MLX splits at [d_inner, d_inner + d_state*n_groups]
     // So: x = first d_inner, B = next d_state*n_groups, C = remaining d_state*n_groups
+    // Note: xBC_conv_read has xBC_channels = 2*d_inner + 2*d_state*n_groups channels
     std::vector<float> x_cpu(x_size);
     std::vector<float> B_cpu(B_size);
     std::vector<float> C_cpu(C_size);
     
     for (int b = 0; b < batch_size; ++b) {
         for (int s = 0; s < seq_len; ++s) {
-            int base_idx = (b * seq_len + s) * conv_dim_;
+            int base_idx = (b * seq_len + s) * xBC_channels;
             // x = first d_inner
             for (int i = 0; i < d_inner_; ++i) {
                 x_cpu[(b * seq_len + s) * d_inner_ + i] = xBC_conv_read[base_idx + i];
@@ -934,6 +1103,9 @@ cl_mem SSDLayer::forward(
             }
         }
     }
+    
+    // Debug: Check conv output and split (only in CPU fallback path)
+    // Note: Debug output moved to CPU fallback section where ssm_call_count is available
     
     clEnqueueWriteBuffer(queue, x_buf, CL_TRUE, 0, x_size * sizeof(float), x_cpu.data(), 0, nullptr, nullptr);
     clEnqueueWriteBuffer(queue, B_buf, CL_TRUE, 0, B_size * sizeof(float), B_cpu.data(), 0, nullptr, nullptr);
@@ -989,9 +1161,11 @@ cl_mem SSDLayer::forward(
     
     // Check if SSM forward kernels are available
     // If not (e.g., PowerVR driver bug), use CPU fallback
+    static int ssm_call_count = 0;
+    ssm_call_count++;
     if (!process_dt_kernel_) {
         // CPU fallback for SSM forward computation (matrix-based, matching MLX)
-        std::cout << "[SSDLayer] Using CPU fallback for SSM forward (GPU kernels not available)" << std::endl;
+        std::cout << "[SSDLayer] Call #" << ssm_call_count << " - Using CPU fallback for SSM forward (GPU kernels not available)" << std::endl;
         
         // Read necessary data from GPU
         std::vector<float> dt_cpu(dt_size);
@@ -1101,23 +1275,43 @@ cl_mem SSDLayer::forward(
         
         // Compute final output: y = tril(CB * decay) @ dtx + D * x
         std::vector<float> y_cpu(x_size);
+        std::cout << "[SSDLayer] Call #" << ssm_call_count << " - Computing output: batch_size=" << batch_size 
+                  << ", seq_len=" << seq_len << ", n_heads_=" << n_heads_ << ", d_head_=" << d_head_ 
+                  << ", d_inner_=" << d_inner_ << ", x_size=" << x_size << std::endl;
+        int computed_count = 0;
         for (int b = 0; b < batch_size; ++b) {
             for (int s = 0; s < seq_len; ++s) {
                 for (int h = 0; h < n_heads_; ++h) {
                     int group_idx = h % n_groups_;
                     for (int d = 0; d < d_head_; ++d) {
                         int x_idx = (b * seq_len + s) * d_inner_ + h * d_head_ + d;
+                        if (x_idx >= x_size) {
+                            std::cerr << "[SSDLayer] ERROR: x_idx=" << x_idx << " >= x_size=" << x_size << std::endl;
+                            continue;
+                        }
                         float output_sum = 0.0f;
                         
                         // tril(CB * decay) @ dtx
                         for (int t = 0; t <= s; ++t) {
                             int x_t_idx = (b * seq_len + t) * d_inner_ + h * d_head_ + d;
+                            if (x_t_idx >= dtx.size()) {
+                                std::cerr << "[SSDLayer] ERROR: x_t_idx=" << x_t_idx << " >= dtx.size()=" << dtx.size() << std::endl;
+                                continue;
+                            }
                             float dtx_t = dtx[x_t_idx];
                             
                             int decay_idx = (b * n_heads_ + h) * seq_len * seq_len + s * seq_len + t;
+                            if (decay_idx >= decay.size()) {
+                                std::cerr << "[SSDLayer] ERROR: decay_idx=" << decay_idx << " >= decay.size()=" << decay.size() << std::endl;
+                                continue;
+                            }
                             float decay_st = decay[decay_idx];
                             
                             int CB_idx = ((b * seq_len + s) * seq_len + t) * n_groups_ + group_idx;
+                            if (CB_idx >= CB.size()) {
+                                std::cerr << "[SSDLayer] ERROR: CB_idx=" << CB_idx << " >= CB.size()=" << CB.size() << std::endl;
+                                continue;
+                            }
                             float CB_st = CB[CB_idx];
                             
                             output_sum += CB_st * decay_st * dtx_t;
@@ -1126,14 +1320,84 @@ cl_mem SSDLayer::forward(
                         // Add D * x
                         output_sum += D_cpu[h] * x_cpu[x_idx];
                         y_cpu[x_idx] = output_sum;
+                        computed_count++;
                     }
                 }
             }
+        }
+        std::cout << "[SSDLayer] Call #" << ssm_call_count << " - Computed " << computed_count << " output values" << std::endl;
+        
+        // Debug: Sample a few values to see what's happening (force print)
+        std::cout << "[SSDLayer] Call #" << ssm_call_count << " - Sample values:" << std::endl;
+        std::cout << "  conv_dim_=" << conv_dim_ << ", d_inner_=" << d_inner_ << ", d_state_=" << d_state_ << ", n_groups_=" << n_groups_ << std::endl;
+        // Read xBC_conv_read from GPU to check if B and C sections are zeros
+        std::vector<float> xBC_conv_check(xBC_size);
+        clEnqueueReadBuffer(queue, xBC_buf, CL_TRUE, 0, xBC_size * sizeof(float), xBC_conv_check.data(), 0, nullptr, nullptr);
+        std::cout << "  xBC_conv_read[0]=" << xBC_conv_check[0] << ", xBC_conv_read[d_inner_]=" 
+                  << (xBC_conv_check.size() > d_inner_ ? xBC_conv_check[d_inner_] : 0.0f) 
+                  << ", xBC_conv_read[d_inner_+d_state*n_groups]=" 
+                  << (xBC_conv_check.size() > (d_inner_ + d_state_ * n_groups_) ? xBC_conv_check[d_inner_ + d_state_ * n_groups_] : 0.0f) << std::endl;
+        if (x_cpu.size() > 0) std::cout << "  x_cpu[0]=" << x_cpu[0] << ", x_cpu[100]=" << (x_cpu.size() > 100 ? x_cpu[100] : 0.0f) << std::endl;
+        if (B_cpu.size() > 0) std::cout << "  B_cpu[0]=" << B_cpu[0] << ", B_cpu[10]=" << (B_cpu.size() > 10 ? B_cpu[10] : 0.0f) << std::endl;
+        if (C_cpu.size() > 0) std::cout << "  C_cpu[0]=" << C_cpu[0] << ", C_cpu[10]=" << (C_cpu.size() > 10 ? C_cpu[10] : 0.0f) << std::endl;
+        if (dt_processed.size() > 0) std::cout << "  dt_processed[0]=" << dt_processed[0] << ", dt_processed[10]=" << (dt_processed.size() > 10 ? dt_processed[10] : 0.0f) << std::endl;
+        if (CB.size() > 0) std::cout << "  CB[0]=" << CB[0] << ", CB[10]=" << (CB.size() > 10 ? CB[10] : 0.0f) << std::endl;
+        if (decay.size() > 0) std::cout << "  decay[0]=" << decay[0] << ", decay[10]=" << (decay.size() > 10 ? decay[10] : 0.0f) << std::endl;
+        if (dtx.size() > 0) std::cout << "  dtx[0]=" << dtx[0] << ", dtx[100]=" << (dtx.size() > 100 ? dtx[100] : 0.0f) << std::endl;
+        if (D_cpu.size() > 0) std::cout << "  D_cpu[0]=" << D_cpu[0] << ", D_cpu[1]=" << (D_cpu.size() > 1 ? D_cpu[1] : 0.0f) << std::endl;
+        if (y_cpu.size() > 0) std::cout << "  y_cpu[0]=" << y_cpu[0] << ", y_cpu[100]=" << (y_cpu.size() > 100 ? y_cpu[100] : 0.0f) << std::endl;
+        
+        // Debug: Check intermediate values before computing output
+        std::cout << "[SSDLayer] Call #" << ssm_call_count << " - Vector sizes: x=" << x_cpu.size() 
+                  << ", CB=" << CB.size() << ", decay=" << decay.size() << ", dtx=" << dtx.size() << std::endl;
+        if (x_cpu.size() > 0 && CB.size() > 0 && decay.size() > 0 && dtx.size() > 0) {
+            float x_min = x_cpu[0], x_max = x_cpu[0], x_sum = 0.0f;
+            float CB_min = CB[0], CB_max = CB[0], CB_sum = 0.0f;
+            float decay_min = decay[0], decay_max = decay[0], decay_sum = 0.0f;
+            float dtx_min = dtx[0], dtx_max = dtx[0], dtx_sum = 0.0f;
+            for (float val : x_cpu) {
+                x_min = std::min(x_min, val);
+                x_max = std::max(x_max, val);
+                x_sum += val;
+            }
+            for (float val : CB) {
+                CB_min = std::min(CB_min, val);
+                CB_max = std::max(CB_max, val);
+                CB_sum += val;
+            }
+            for (float val : decay) {
+                decay_min = std::min(decay_min, val);
+                decay_max = std::max(decay_max, val);
+                decay_sum += val;
+            }
+            for (float val : dtx) {
+                dtx_min = std::min(dtx_min, val);
+                dtx_max = std::max(dtx_max, val);
+                dtx_sum += val;
+            }
+            std::cout << "[SSDLayer] Call #" << ssm_call_count << " - Intermediate stats:" << std::endl;
+            std::cout << "  x: min=" << x_min << ", max=" << x_max << ", mean=" << (x_sum / x_cpu.size()) << std::endl;
+            std::cout << "  CB: min=" << CB_min << ", max=" << CB_max << ", mean=" << (CB_sum / CB.size()) << std::endl;
+            std::cout << "  decay: min=" << decay_min << ", max=" << decay_max << ", mean=" << (decay_sum / decay.size()) << std::endl;
+            std::cout << "  dtx: min=" << dtx_min << ", max=" << dtx_max << ", mean=" << (dtx_sum / dtx.size()) << std::endl;
+        } else {
+            std::cout << "[SSDLayer] ERROR: Empty vectors detected!" << std::endl;
         }
         
         // Write result back to GPU
         clEnqueueWriteBuffer(queue, x_buf, CL_TRUE, 0, x_size * sizeof(float), y_cpu.data(), 0, nullptr, nullptr);
         clFinish(queue);
+        
+        // Debug: Check SSM output stats
+        float y_min = y_cpu[0], y_max = y_cpu[0], y_sum = 0.0f;
+        for (float val : y_cpu) {
+            y_min = std::min(y_min, val);
+            y_max = std::max(y_max, val);
+            y_sum += val;
+        }
+        float y_mean = y_sum / y_cpu.size();
+        std::cout << "[SSDLayer] Call #" << ssm_call_count << " - SSM output stats: min=" << y_min 
+                  << ", max=" << y_max << ", mean=" << y_mean << std::endl;
         
         // CPU fallback complete - continue with gate and norm
         // (skip GPU kernel cleanup since we didn't allocate those buffers)

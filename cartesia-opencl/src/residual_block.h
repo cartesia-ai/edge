@@ -93,6 +93,9 @@ public:
     
     bool isStateful() const { return stateful_; }
     
+    // Set norm weights (for loading from file)
+    void setNormWeights(const std::vector<float>& weights);
+    
 private:
     OpenCLContextManager* ctx_;
     Layer* layer_;

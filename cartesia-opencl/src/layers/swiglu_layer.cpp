@@ -1,6 +1,7 @@
 #include "swiglu_layer.h"
 #include "../opencl_context.h"
 #include "linear_layer.h"
+#include "rms_norm_layer.h"
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -47,6 +48,12 @@ SwiGLULayer::SwiGLULayer(OpenCLContextManager* ctx, int d_model, int expand)
     gate_layer_ = std::make_unique<LinearLayer>(ctx_, d_model, d_inner_, false);
     up_layer_ = std::make_unique<LinearLayer>(ctx_, d_model, d_inner_, false);
     down_layer_ = std::make_unique<LinearLayer>(ctx_, d_inner_, d_model, false);
+    
+    // Create RMS norm layer (applied after GLU combine, before out_proj)
+    norm_layer_ = std::make_unique<RMSNormLayer>(ctx_, d_inner_);
+    // Initialize with ones (matching MLX default)
+    std::vector<float> norm_weights(d_inner_, 1.0f);
+    norm_layer_->initializeWeights(norm_weights);
     
     buildKernels();
 }
@@ -248,16 +255,16 @@ cl_mem SwiGLULayer::forward(
         throw std::runtime_error("SwiGLU weights not initialized");
     }
     
-    // Gate projection: input -> d_inner
+    // In projection: input -> d_inner (this gets activated with Swish)
+    cl_mem in_out = up_layer_->forward(input, batch_size, seq_len, queue);
+    
+    // Gate projection: input -> d_inner (this is multiplied, not activated)
     cl_mem gate_out = gate_layer_->forward(input, batch_size, seq_len, queue);
     
-    // Up projection: input -> d_inner
-    cl_mem up_out = up_layer_->forward(input, batch_size, seq_len, queue);
+    // Apply Swish to in_proj output (not gate!)
+    cl_mem in_swish = applySwish(in_out, batch_size, seq_len, queue);
     
-    // Apply Swish to gate
-    cl_mem gate_swish = applySwish(gate_out, batch_size, seq_len, queue);
-    
-    // Combine: gate_swish * up
+    // Combine: in_swish * gate (swish(in_proj) * gate_proj, matching MLX)
     cl_context context = ctx_->getContext();
     int size = batch_size * seq_len * d_inner_;
     
@@ -268,8 +275,8 @@ cl_mem SwiGLULayer::forward(
     }
     
     cl_int err;
-    err = clSetKernelArg(combine_kernel_, 0, sizeof(cl_mem), &gate_swish);
-    err |= clSetKernelArg(combine_kernel_, 1, sizeof(cl_mem), &up_out);
+    err = clSetKernelArg(combine_kernel_, 0, sizeof(cl_mem), &in_swish);
+    err |= clSetKernelArg(combine_kernel_, 1, sizeof(cl_mem), &gate_out);
     err |= clSetKernelArg(combine_kernel_, 2, sizeof(cl_mem), &intermediate_);
     err |= clSetKernelArg(combine_kernel_, 3, sizeof(int), &size);
     
@@ -283,8 +290,11 @@ cl_mem SwiGLULayer::forward(
         throw std::runtime_error("Failed to enqueue swiglu_combine kernel");
     }
     
-    // Down projection: intermediate -> d_model
-    cl_mem output = down_layer_->forward(intermediate_, batch_size, seq_len, queue);
+    // Apply RMS norm to intermediate (matching MLX: y = self.norm(y) after GLU)
+    cl_mem intermediate_normed = norm_layer_->forward(intermediate_, batch_size, seq_len, queue);
+    
+    // Down projection: intermediate_normed -> d_model
+    cl_mem output = down_layer_->forward(intermediate_normed, batch_size, seq_len, queue);
     
     return output;
 }
@@ -299,17 +309,17 @@ cl_mem SwiGLULayer::step(
         throw std::runtime_error("SwiGLU weights not initialized");
     }
     
-    // Gate and up projections
+    // In and gate projections
     std::cout << " [gate_proj]..." << std::flush;
     cl_mem gate_out = gate_layer_->step(input, batch_size, queue);
     std::cout << " [up_proj]..." << std::flush;
-    cl_mem up_out = up_layer_->step(input, batch_size, queue);
+    cl_mem in_out = up_layer_->step(input, batch_size, queue);
     
-    // Apply Swish to gate
+    // Apply Swish to in_proj output (not gate!)
     std::cout << " [swish]..." << std::flush;
-    cl_mem gate_swish = applySwishStep(gate_out, batch_size, queue);
+    cl_mem in_swish = applySwishStep(in_out, batch_size, queue);
     
-    // Combine
+    // Combine: in_swish * gate (swish(in_proj) * gate_proj, matching MLX)
     std::cout << " [combine]..." << std::flush;
     cl_context context = ctx_->getContext();
     int size = batch_size * d_inner_;
@@ -321,8 +331,8 @@ cl_mem SwiGLULayer::step(
     }
     
     cl_int err;
-    err = clSetKernelArg(combine_kernel_, 0, sizeof(cl_mem), &gate_swish);
-    err |= clSetKernelArg(combine_kernel_, 1, sizeof(cl_mem), &up_out);
+    err = clSetKernelArg(combine_kernel_, 0, sizeof(cl_mem), &in_swish);
+    err |= clSetKernelArg(combine_kernel_, 1, sizeof(cl_mem), &gate_out);
     err |= clSetKernelArg(combine_kernel_, 2, sizeof(cl_mem), &intermediate_step_);
     err |= clSetKernelArg(combine_kernel_, 3, sizeof(int), &size);
     
@@ -336,9 +346,12 @@ cl_mem SwiGLULayer::step(
         throw std::runtime_error("Failed to enqueue swiglu_combine kernel");
     }
     
+    // Apply RMS norm to intermediate (matching MLX: y = self.norm(y) after GLU)
+    cl_mem intermediate_normed = norm_layer_->step(intermediate_step_, batch_size, queue);
+    
     // Down projection
     std::cout << " [down_proj]..." << std::flush;
-    cl_mem output = down_layer_->step(intermediate_step_, batch_size, queue);
+    cl_mem output = down_layer_->step(intermediate_normed, batch_size, queue);
     
     return output;
 }
