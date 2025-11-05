@@ -43,7 +43,8 @@ public:
         cl_mem input,
         int batch_size,
         std::vector<LayerState>* state,
-        cl_command_queue queue
+        cl_command_queue queue,
+        const std::string& output_prefix = ""
     );
     
     int getDModel() const { return d_model_; }

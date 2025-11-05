@@ -286,7 +286,8 @@ __kernel void scaled_dot_product_attention(
     const int seq_len_q,
     const int seq_len_kv,
     const int d_head,
-    const int causal
+    const int causal,
+    const int cached_len
 ) {
     const int batch_idx = get_global_id(0);
     const int head_idx = get_global_id(1);
@@ -301,7 +302,11 @@ __kernel void scaled_dot_product_attention(
     
     // Compute Q @ K^T
     for (int seq_kv_idx = 0; seq_kv_idx < actual_seq_len; ++seq_kv_idx) {
-        if (causal && seq_kv_idx > seq_q_idx) {
+        // Check causal mask
+        // In step mode with cached KV, the query is at position (cached_len + seq_q_idx) in the full sequence
+        // So we mask positions > (cached_len + seq_q_idx)
+        // For forward pass (cached_len == 0), this reduces to seq_kv_idx > seq_q_idx
+        if (causal && seq_kv_idx > (cached_len + seq_q_idx)) {
             scores[seq_kv_idx] = -FLT_MAX;
             continue;
         }
@@ -831,6 +836,31 @@ cl_mem AttentionLayer::forward(
                 checked_prefill_keys = true;
             }
             
+            // Dump keys/values from prefill for comparison (first time only)
+            static bool dumped_prefill_kv = false;
+            if (!dumped_prefill_kv) {
+                size_t keys_size = batch_size * kv_heads_ * seq_len * d_head_;
+                std::vector<float> keys_dump(keys_size);
+                std::vector<float> values_dump(keys_size);
+                cl_int read_err1 = clEnqueueReadBuffer(queue, keys_reshaped_, CL_TRUE, 0,
+                    keys_size * sizeof(float), keys_dump.data(), 0, nullptr, nullptr);
+                cl_int read_err2 = clEnqueueReadBuffer(queue, values_reshaped_, CL_TRUE, 0,
+                    keys_size * sizeof(float), values_dump.data(), 0, nullptr, nullptr);
+                if (read_err1 == CL_SUCCESS && read_err2 == CL_SUCCESS) {
+                    std::ofstream keys_out("/data/local/tmp/output_opencl_tiny_prefill_layer_6_keys.bin", std::ios::binary);
+                    std::ofstream values_out("/data/local/tmp/output_opencl_tiny_prefill_layer_6_values.bin", std::ios::binary);
+                    if (keys_out.is_open() && values_out.is_open()) {
+                        keys_out.write(reinterpret_cast<const char*>(keys_dump.data()), keys_dump.size() * sizeof(float));
+                        values_out.write(reinterpret_cast<const char*>(values_dump.data()), values_dump.size() * sizeof(float));
+                        keys_out.close();
+                        values_out.close();
+                        std::cout << "\n  [Debug] Dumped prefill KV cache: keys_size=" << keys_size 
+                                  << " values_size=" << keys_size << std::endl;
+                    }
+                    dumped_prefill_kv = true;
+                }
+            }
+            
             retainAndAssign(state->state1, keys_reshaped_);
             retainAndAssign(state->state2, values_reshaped_);
             // state3 unused for now
@@ -852,7 +882,13 @@ cl_mem AttentionLayer::forward(
     err |= clSetKernelArg(attention_kernel_, 10, sizeof(int), &d_head_);
     int causal_int = causal_ ? 1 : 0;
     err |= clSetKernelArg(attention_kernel_, 11, sizeof(int), &causal_int);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to set attention kernel args");
+    // Use seq_len_kv - seq_len if we have cached state (seq_len_kv > seq_len), otherwise 0
+    int cached_len_for_mask = (state && !state->is_null() && state->state1 && state->state2 && seq_len_kv > seq_len) ? 
+        (seq_len_kv - seq_len) : 0;
+    err |= clSetKernelArg(attention_kernel_, 12, sizeof(int), &cached_len_for_mask);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to set attention kernel arg 12 (cached_len) err=" + std::to_string(err) + ", cached_len_for_mask=" + std::to_string(cached_len_for_mask));
+    }
     
     size_t attn_global[3] = {static_cast<size_t>(batch_size), static_cast<size_t>(n_heads_), 
                             static_cast<size_t>(seq_len)};
@@ -1097,6 +1133,35 @@ cl_mem AttentionLayer::step(
         throw std::runtime_error("Failed to enqueue reshape_kv kernel for values (err=" + std::to_string(err) + ")");
     }
     
+    // Dump QKV from step mode for comparison (first step only)
+    static bool dumped_step_qkv = false;
+    if (!dumped_step_qkv && state && !state->is_null() && state->state1 && state->state2) {
+        size_t q_size = batch_size * n_heads_ * seq_len * d_head_;
+        size_t kv_size_new = batch_size * kv_heads_ * seq_len * d_head_;
+        std::vector<float> queries_dump(q_size);
+        std::vector<float> keys_new_dump(kv_size_new);
+        std::vector<float> values_new_dump(kv_size_new);
+        cl_int read_q = clEnqueueReadBuffer(queue, queries_reshaped_, CL_TRUE, 0, q_size * sizeof(float), queries_dump.data(), 0, nullptr, nullptr);
+        cl_int read_k = clEnqueueReadBuffer(queue, keys_reshaped_, CL_TRUE, 0, kv_size_new * sizeof(float), keys_new_dump.data(), 0, nullptr, nullptr);
+        cl_int read_v = clEnqueueReadBuffer(queue, values_reshaped_, CL_TRUE, 0, kv_size_new * sizeof(float), values_new_dump.data(), 0, nullptr, nullptr);
+        if (read_q == CL_SUCCESS && read_k == CL_SUCCESS && read_v == CL_SUCCESS) {
+            std::ofstream q_out("/data/local/tmp/output_opencl_tiny_gen_step_0_layer_6_query.bin", std::ios::binary);
+            std::ofstream k_out("/data/local/tmp/output_opencl_tiny_gen_step_0_layer_6_keys_new.bin", std::ios::binary);
+            std::ofstream v_out("/data/local/tmp/output_opencl_tiny_gen_step_0_layer_6_values_new.bin", std::ios::binary);
+            if (q_out.is_open() && k_out.is_open() && v_out.is_open()) {
+                q_out.write(reinterpret_cast<const char*>(queries_dump.data()), queries_dump.size() * sizeof(float));
+                k_out.write(reinterpret_cast<const char*>(keys_new_dump.data()), keys_new_dump.size() * sizeof(float));
+                v_out.write(reinterpret_cast<const char*>(values_new_dump.data()), values_new_dump.size() * sizeof(float));
+                q_out.close();
+                k_out.close();
+                v_out.close();
+                std::cout << "\n  [Debug] Dumped gen step 0 QKV: q_size=" << q_size 
+                          << " kv_new_size=" << kv_size_new << std::endl;
+            }
+            dumped_step_qkv = true;
+        }
+    }
+    
     // Handle state - concatenate with cached keys/values
     cl_mem final_keys = keys_reshaped_;
     cl_mem final_values = values_reshaped_;
@@ -1211,6 +1276,9 @@ cl_mem AttentionLayer::step(
         final_values = values_concat_;
         seq_len_kv = total_len;
         
+        // Store cached_len before updating cached_kv_len_ for use in mask
+        int cached_len_before_update = cached_len;
+        
         // Update state with proper retain/release
         retainAndAssign(state->state1, final_keys);
         retainAndAssign(state->state2, final_values);
@@ -1239,8 +1307,21 @@ cl_mem AttentionLayer::step(
     err |= clSetKernelArg(attention_kernel_, 10, sizeof(int), &d_head_);
     int causal_int = causal_ ? 1 : 0;
     err |= clSetKernelArg(attention_kernel_, 11, sizeof(int), &causal_int);
+    // Use cached_len_before_update if we had cached state, otherwise 0
+    int cached_len_for_mask = (state && !state->is_null() && state->state1 && state->state2 && seq_len_kv > seq_len) ? 
+        (seq_len_kv - seq_len) : 0;
+    
+    // Debug: Print cached_len_for_mask for first step only
+    static bool printed_cached_len_debug = false;
+    if (!printed_cached_len_debug && seq_len == 1) {
+        std::cout << "\n  [Attention Step Debug] seq_len=" << seq_len << ", seq_len_kv=" << seq_len_kv 
+                  << ", cached_len_for_mask=" << cached_len_for_mask << std::endl;
+        printed_cached_len_debug = true;
+    }
+    
+    err |= clSetKernelArg(attention_kernel_, 12, sizeof(int), &cached_len_for_mask);
     if (err != CL_SUCCESS) {
-        throw std::runtime_error("Failed to set attention kernel args (err=" + std::to_string(err) + ", seq_len_kv=" + std::to_string(seq_len_kv) + ")");
+        throw std::runtime_error("Failed to set attention kernel arg 12 (cached_len) err=" + std::to_string(err) + ", cached_len_for_mask=" + std::to_string(cached_len_for_mask) + ", seq_len_kv=" + std::to_string(seq_len_kv));
     }
     size_t attn_global[3] = {static_cast<size_t>(batch_size), static_cast<size_t>(n_heads_), 
                             static_cast<size_t>(seq_len)};

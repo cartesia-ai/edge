@@ -58,37 +58,14 @@ int Sampler::sampleFromProbs(const std::vector<float>& probs) {
 }
 
 int Sampler::categoricalSample(const std::vector<float>& logits, float temperature) {
-    // Clip logits to prevent numerical instability
-    std::vector<float> clipped_logits = logits;
-    const float MAX_LOGIT = 50.0f;
-    const float MIN_LOGIT = -50.0f;
-    for (float& l : clipped_logits) {
-        if (std::isnan(l) || std::isinf(l)) {
-            l = 0.0f;
-        } else {
-            l = std::max(MIN_LOGIT, std::min(MAX_LOGIT, l));
-        }
-    }
-    
-    auto probs = softmax(clipped_logits, temperature);
+    // Match MLX: no clipping, use logits directly
+    auto probs = softmax(logits, temperature);
     return sampleFromProbs(probs);
 }
 
 int Sampler::topPSample(const std::vector<float>& logits, float top_p, float temperature) {
-    // Clip logits to prevent numerical instability
-    // MLX/numpy typically handle this better, so we clip to reasonable range
-    std::vector<float> clipped_logits = logits;
-    const float MAX_LOGIT = 50.0f;  // Clamp to reasonable range for numerical stability
-    const float MIN_LOGIT = -50.0f;
-    for (float& l : clipped_logits) {
-        if (std::isnan(l) || std::isinf(l)) {
-            l = 0.0f;  // Replace NaN/Inf with 0
-        } else {
-            l = std::max(MIN_LOGIT, std::min(MAX_LOGIT, l));
-        }
-    }
-    
-    auto probs = softmax(clipped_logits, temperature);
+    // Match MLX: no clipping, use logits directly (MLX handles NaN/Inf internally)
+    auto probs = softmax(logits, temperature);
     
     // Create indices and sort by probability (descending)
     std::vector<size_t> indices(probs.size());
@@ -136,6 +113,9 @@ int Sampler::topPSample(const std::vector<float>& logits, float top_p, float tem
         }
     }
     
+    // Match MLX: MLX uses mx.random.categorical(mx.log(top_probs))
+    // This is equivalent to sampling from normalized probabilities, but MLX uses log-space for numerical stability
+    // We'll use the standard categorical sampling from normalized probabilities (equivalent result)
     return sampleFromProbs(filtered_probs);
 }
 

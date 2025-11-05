@@ -111,12 +111,23 @@ add_executable(cartesia_opencl_test
     src/layers/swiglu_layer.cpp
     src/layers/attention_layer.cpp
     src/layers/ssd_layer.cpp
+    src/tokenizer.cpp
 )
+
+# Test executable for tokenizer (commented out - file doesn't exist)
+# add_executable(test_tokenizer
+#     test_tokenizer.cpp
+#     src/tokenizer.cpp
+# )
 
 target_include_directories(cartesia_opencl_test PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCL_INCLUDE_DIR}
 )
+
+# target_include_directories(test_tokenizer PRIVATE 
+#     ${CMAKE_CURRENT_SOURCE_DIR}
+# )
 
 # For Android cross-compilation, we need to link against OpenCL but allow it to be found at runtime
 if(ANDROID)

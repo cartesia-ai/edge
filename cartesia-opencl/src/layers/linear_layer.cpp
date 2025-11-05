@@ -72,46 +72,15 @@ __kernel void matmul(
     if (batch_idx >= batch_size || row >= m || col >= n) return;
     
     float sum = 0.0f;
-    const float max_val = 1e10f;  // Prevent overflow
-    const float min_val = -1e10f;
     
     for (int i = 0; i < k; ++i) {
         int a_idx = batch_idx * m * k + row * k + i;
         int b_idx = i * n + col;
         
-        float a_val = A[a_idx];
-        float b_val = B[b_idx];
-        
-        // Clamp to prevent Inf/NaN and overflow
-        if (isnan(a_val) || isinf(a_val)) a_val = 0.0f;
-        if (isnan(b_val) || isinf(b_val)) b_val = 0.0f;
-        if (a_val > max_val) a_val = max_val;
-        if (a_val < min_val) a_val = min_val;
-        if (b_val > max_val) b_val = max_val;
-        if (b_val < min_val) b_val = min_val;
-        
-        float product = a_val * b_val;
-        // Clamp product to prevent sum overflow
-        if (product > max_val) product = max_val;
-        if (product < min_val) product = min_val;
-        
-        sum += product;
-        
-        // Clamp sum periodically to prevent accumulation overflow
-        if (sum > max_val) sum = max_val;
-        if (sum < min_val) sum = min_val;
+        sum += A[a_idx] * B[b_idx];
     }
     
     int c_idx = batch_idx * m * n + row * n + col;
-    
-    // Final clamp before writing
-    if (isnan(sum) || isinf(sum)) {
-        sum = 0.0f;
-    } else {
-        if (sum > max_val) sum = max_val;
-        if (sum < min_val) sum = min_val;
-    }
-    
     C[c_idx] = sum;
 }
 
@@ -128,39 +97,9 @@ __kernel void matvec(
     if (row >= m) return;
     
     float sum = 0.0f;
-    const float max_val = 1e10f;  // Prevent overflow
-    const float min_val = -1e10f;
     
     for (int i = 0; i < n; ++i) {
-        float a_val = A[row * n + i];
-        float x_val = x[i];
-        
-        // Clamp to prevent Inf/NaN and overflow
-        if (isnan(a_val) || isinf(a_val)) a_val = 0.0f;
-        if (isnan(x_val) || isinf(x_val)) x_val = 0.0f;
-        if (a_val > max_val) a_val = max_val;
-        if (a_val < min_val) a_val = min_val;
-        if (x_val > max_val) x_val = max_val;
-        if (x_val < min_val) x_val = min_val;
-        
-        float product = a_val * x_val;
-        // Clamp product to prevent sum overflow
-        if (product > max_val) product = max_val;
-        if (product < min_val) product = min_val;
-        
-        sum += product;
-        
-        // Clamp sum periodically to prevent accumulation overflow
-        if (sum > max_val) sum = max_val;
-        if (sum < min_val) sum = min_val;
-    }
-    
-    // Final clamp before writing
-    if (isnan(sum) || isinf(sum)) {
-        sum = 0.0f;
-    } else {
-        if (sum > max_val) sum = max_val;
-        if (sum < min_val) sum = min_val;
+        sum += A[row * n + i] * x[i];
     }
     
     y[row] = sum;

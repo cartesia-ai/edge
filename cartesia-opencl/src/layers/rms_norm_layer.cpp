@@ -61,28 +61,10 @@ __kernel void rms_norm(
     const int seq_idx = idx / d_model;
     const int feat_idx = idx % d_model;
     
-    // Clamp input values to prevent Inf/NaN propagation
-    float input_val = input[idx];
-    if (isnan(input_val) || isinf(input_val)) {
-        output[idx] = 0.0f;
-        return;
-    }
-    
-    // Clamp to reasonable range to prevent overflow in mean_square calculation
-    float clamped_input = input_val;
-    const float max_val = 1e10f;  // Reasonable maximum to prevent overflow
-    const float min_val = -1e10f;
-    if (clamped_input > max_val) clamped_input = max_val;
-    if (clamped_input < min_val) clamped_input = min_val;
-    
-    // Calculate mean square within this sequence element
+    // Calculate mean square within this sequence element (match MLX: no clamping, 32-bit precision)
     float mean_square = 0.0f;
     for (int i = 0; i < d_model; ++i) {
         float val = input[seq_idx * d_model + i];
-        // Clamp values to prevent overflow
-        if (val > max_val) val = max_val;
-        if (val < min_val) val = min_val;
-        if (isnan(val) || isinf(val)) val = 0.0f;
         mean_square += val * val;
     }
     mean_square /= d_model;
@@ -90,23 +72,9 @@ __kernel void rms_norm(
     // RMS = sqrt(mean_square + eps)
     float rms = sqrt(mean_square + eps);
     
-    // Ensure rms is valid
-    if (isnan(rms) || isinf(rms) || rms <= 0.0f) {
-        rms = 1.0f;  // Safe fallback
-    }
-    
-    // Normalize: output = (input / rms) * weight
+    // Normalize: output = (input / rms) * weight (match MLX exactly)
     float weight_val = weight[feat_idx];
-    if (isnan(weight_val) || isinf(weight_val)) {
-        weight_val = 1.0f;  // Safe fallback
-    }
-    
-    output[idx] = (clamped_input / rms) * weight_val;
-    
-    // Final clamp to prevent Inf/NaN in output
-    if (isnan(output[idx]) || isinf(output[idx])) {
-        output[idx] = 0.0f;
-    }
+    output[idx] = (input[idx] / rms) * weight_val;
 }
 )";
     
@@ -232,7 +200,7 @@ __kernel void zero_buffer(__global float* buffer, const int size) {
     err |= clSetKernelArg(kernel_, 2, sizeof(cl_mem), &output_buffer_);
     err |= clSetKernelArg(kernel_, 3, sizeof(int), &d_model_);
     err |= clSetKernelArg(kernel_, 4, sizeof(int), &total_elements);
-    const float eps = 1e-6f;
+    const float eps = 1e-5f;  // Match MLX default epsilon (was 1e-6)
     err |= clSetKernelArg(kernel_, 5, sizeof(float), &eps);
     
     if (err != CL_SUCCESS) {

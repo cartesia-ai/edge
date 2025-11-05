@@ -173,8 +173,26 @@ cl_mem SequenceModel::forward(
         }
     }
     
+    // Check output before post-norm
+    if (!output_prefix.empty()) {
+        size_t buf_size = 0;
+        cl_int info_err = clGetMemObjectInfo(current, CL_MEM_SIZE, sizeof(size_t), &buf_size, nullptr);
+        if (info_err == CL_SUCCESS && buf_size > 0) {
+            std::vector<float> before_postnorm(buf_size / sizeof(float));
+            cl_int read_err = clEnqueueReadBuffer(queue, current, CL_TRUE, 0, buf_size, before_postnorm.data(), 0, nullptr, nullptr);
+            if (read_err == CL_SUCCESS) {
+                int nan_count = 0;
+                for (float val : before_postnorm) {
+                    if (std::isnan(val)) { nan_count++; }
+                }
+                std::cout << "\n  [Before Post-Norm] NaN count: " << nan_count << " out of " << before_postnorm.size() << " values" << std::endl;
+            }
+        }
+    }
+    
     // Apply post-norm if needed
     if (use_post_norm_ && post_norm_) {
+        std::cout << "\n  [Post-Norm] Applying post-norm..." << std::flush;
         if (!norm_layer_) {
             // Initialize norm layer if not already done
             norm_layer_ = std::make_unique<RMSNormLayer>(ctx_, d_model_);
@@ -182,6 +200,24 @@ cl_mem SequenceModel::forward(
             norm_layer_->initializeWeights(norm_weights);
         }
         current = norm_layer_->forward(current, batch_size, seq_len, queue);
+        std::cout << " ✓" << std::endl;
+        
+        // Check output after post-norm
+        size_t buf_size = 0;
+        cl_int info_err = clGetMemObjectInfo(current, CL_MEM_SIZE, sizeof(size_t), &buf_size, nullptr);
+        if (info_err == CL_SUCCESS && buf_size > 0) {
+            std::vector<float> after_postnorm(buf_size / sizeof(float));
+            cl_int read_err = clEnqueueReadBuffer(queue, current, CL_TRUE, 0, buf_size, after_postnorm.data(), 0, nullptr, nullptr);
+            if (read_err == CL_SUCCESS) {
+                int nan_count = 0;
+                for (float val : after_postnorm) {
+                    if (std::isnan(val)) { nan_count++; }
+                }
+                std::cout << "  [After Post-Norm] NaN count: " << nan_count << " out of " << after_postnorm.size() << " values" << std::endl;
+            }
+        }
+    } else {
+        std::cout << "\n  [Post-Norm] Post-norm is disabled (use_post_norm_=" << use_post_norm_ << ", post_norm_=" << (post_norm_ ? "true" : "false") << ")" << std::endl;
     }
     
     return current;
@@ -191,7 +227,8 @@ cl_mem SequenceModel::step(
     cl_mem input,
     int batch_size,
     std::vector<LayerState>* state,
-    cl_command_queue queue
+    cl_command_queue queue,
+    const std::string& output_prefix
 ) {
     // TODO: Implement full step function through all layers
     // For now, just return input (identity)
@@ -256,6 +293,34 @@ cl_mem SequenceModel::step(
             info_err = clGetMemObjectInfo(current, CL_MEM_SIZE, sizeof(size_t), &buf_size, nullptr);
             if (info_err != CL_SUCCESS) {
                 throw std::runtime_error("Layer " + std::to_string(i) + " returned invalid buffer (err=" + std::to_string(info_err) + ")");
+            }
+            
+            // Dump layer outputs for comparison with MLX (if output_prefix is provided)
+            if (!output_prefix.empty() && current) {
+                std::vector<float> layer_output(buf_size / sizeof(float));
+                cl_int read_err = clEnqueueReadBuffer(queue, current, CL_TRUE, 0, buf_size, layer_output.data(), 0, nullptr, nullptr);
+                if (read_err == CL_SUCCESS) {
+                    // Calculate stats
+                    float min_val = layer_output[0], max_val = layer_output[0], sum_val = 0.0f;
+                    for (float val : layer_output) {
+                        min_val = std::min(min_val, val);
+                        max_val = std::max(max_val, val);
+                        sum_val += val;
+                    }
+                    float mean_val = sum_val / layer_output.size();
+                    
+                    // Match MLX naming: {output_prefix}_gen_step_0_layer_{i}_output_opencl.bin
+                    std::stringstream ss;
+                    ss << output_prefix << "_gen_step_0_layer_" << i << "_output_opencl.bin";
+                    std::ofstream out(ss.str(), std::ios::binary);
+                    if (out.is_open()) {
+                        out.write(reinterpret_cast<const char*>(layer_output.data()), layer_output.size() * sizeof(float));
+                        out.close();
+                        int d_model = buf_size / sizeof(float) / batch_size;
+                        std::cout << "\n  [OpenCL Debug] Dumped gen step 0 layer " << i << " output to " << ss.str()
+                                  << " (shape: (" << batch_size << ", " << d_model << "))" << std::endl;
+                    }
+                }
             }
             
             // NaN/Inf check for first generation step only

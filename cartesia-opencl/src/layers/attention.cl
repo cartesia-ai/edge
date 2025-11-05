@@ -97,7 +97,8 @@ __kernel void scaled_dot_product_attention(
     const int seq_len_q,
     const int seq_len_kv,
     const int d_head,
-    const int causal  // 1 for causal masking, 0 otherwise
+    const int causal,  // 1 for causal masking, 0 otherwise
+    const int cached_len  // Length of cached KV (0 for no cache, used for proper causal masking in step mode)
 ) {
     const int batch_idx = get_global_id(0);
     const int head_idx = get_global_id(1);
@@ -115,7 +116,10 @@ __kernel void scaled_dot_product_attention(
     // Compute Q @ K^T
     for (int seq_kv_idx = 0; seq_kv_idx < seq_len_kv && seq_kv_idx < 128; ++seq_kv_idx) {
         // Check causal mask
-        if (causal && seq_kv_idx > seq_q_idx) {
+        // In step mode with cached KV, the query is at position (cached_len + seq_q_idx) in the full sequence
+        // So we mask positions > (cached_len + seq_q_idx)
+        // For forward pass (cached_len == 0), this reduces to seq_kv_idx > seq_q_idx
+        if (causal && seq_kv_idx > (cached_len + seq_q_idx)) {
             scores[seq_kv_idx] = -INFINITY;
             continue;
         }

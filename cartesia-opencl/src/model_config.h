@@ -2,16 +2,16 @@
 
 namespace cartesia_opencl {
 
-// Rene model configuration (Rene-v0.1-1.3b)
-// REDUCED for Android device memory constraints (1.3 GB total GPU memory)
-// Full model (d_model=2048, 48 layers) needs ~5-6 GB
+// Mamba2-130M model configuration (for testing)
+// This is the smallest model for easier debugging and comparison
+// Architecture: Pure SSD (all 24 layers are SSD, no SwiGLU or Attention)
 
-// Model dimensions - REDUCED FOR DEVICE MEMORY
-constexpr int D_MODEL = 1024;           // Reduced from 2048 (1/4 memory per layer)
-constexpr int VOCAB_SIZE = 50288;       // Vocabulary size (padded to multiple of 16, Rene uses 50280)
-constexpr int N_LAYER = 12;             // Reduced from 48 layers
-constexpr int N_LAYER_REPEATS = 1;      // 1 repeat (12 unique layers, no repeats)
-constexpr int N_UNIQUE_LAYERS = 12;     // Number of unique layer configurations
+// Model dimensions - Mamba2-130M
+constexpr int D_MODEL = 768;            // Mamba2-130M size
+constexpr int VOCAB_SIZE = 50288;       // Vocabulary size
+constexpr int N_LAYER = 24;             // Mamba2-130M has 24 layers (all SSD)
+constexpr int N_LAYER_REPEATS = 1;      // 1 repeat (24 SSD layers)
+constexpr int N_UNIQUE_LAYERS = 1;      // Only 1 unique layer type (SSD)
 
 // Layer type indices (0-based, for the 12 unique layers)
 // These correspond to the layer sequence in LM.base_cfg unique_layers

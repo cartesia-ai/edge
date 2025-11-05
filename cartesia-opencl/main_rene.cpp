@@ -18,6 +18,7 @@
 #include "src/lm_head.h"
 #include "src/sampling.h"
 #include "src/weights.h"
+#include "src/tokenizer.h"
 #include <cstdlib>
 #include <ctime>
 #include <cmath>
@@ -208,20 +209,22 @@ int main(int argc, char* argv[]) {
         
         // Parse arguments
         if (argc < 2) {
-            std::cerr << "Usage: " << argv[0] << " <token_file.bin> [weights_dir] [output_file.bin] [max_tokens]" << std::endl;
+            std::cerr << "Usage: " << argv[0] << " <token_file.bin|text> [weights_dir] [output_file.bin] [max_tokens]" << std::endl;
             std::cerr << "  token_file.bin: Input file with token IDs (int32 binary)" << std::endl;
+            std::cerr << "  text: English text to tokenize (if not a file path)" << std::endl;
             std::cerr << "  weights_dir: Directory containing model weights (optional, generates random if not provided)" << std::endl;
             std::cerr << "  output_file.bin: Output file for generated tokens (default: /data/local/tmp/output_tokens.bin)" << std::endl;
             std::cerr << "  max_tokens: Maximum tokens to generate (default: 3)" << std::endl;
             return 1;
         }
         
-        std::string token_file = argv[1];
+        std::string input_arg = argv[1];
         std::string weights_dir = (argc >= 3) ? argv[2] : "";
         std::string output_file = (argc >= 4) ? argv[3] : "/data/local/tmp/output_tokens.bin";
         int max_tokens = (argc >= 5) ? std::stoi(argv[4]) : 3;
         
         bool use_pretrained_weights = !weights_dir.empty();
+        bool is_text_input = false;
         
         // Try to read model config from metadata.json if available
         int ACTUAL_VOCAB_SIZE = VOCAB_SIZE;  // Default: 50288
@@ -291,15 +294,92 @@ int main(int argc, char* argv[]) {
         // Use fixed seed for reproducible weights (for MLX comparison)
         std::srand(42);  // Fixed seed instead of time-based
         
-        // Read input tokens
-        std::cout << "Reading token file: " << token_file << std::endl;
-        std::vector<int32_t> prompt_tokens = readTokenFile(token_file);
-        std::cout << "Loaded " << prompt_tokens.size() << " prompt tokens: [";
-        for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-            std::cout << prompt_tokens[i];
-            if (i < prompt_tokens.size() - 1) std::cout << ", ";
+        // Detect if input is a file or text
+        std::vector<int32_t> prompt_tokens;
+        std::ifstream test_file(input_arg);
+        if (test_file.good()) {
+            // File exists - read binary tokens (backward compatible)
+            test_file.close();
+            std::cout << "Reading token file: " << input_arg << std::endl;
+            prompt_tokens = readTokenFile(input_arg);
+            std::cout << "Loaded " << prompt_tokens.size() << " prompt tokens: [";
+            for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+                std::cout << prompt_tokens[i];
+                if (i < prompt_tokens.size() - 1) std::cout << ", ";
+            }
+            std::cout << "]" << std::endl;
+        } else {
+            // Treat as text input - tokenize it
+            is_text_input = true;
+            std::cout << "Detected text input: \"" << input_arg << "\"" << std::endl;
+            
+            if (!use_pretrained_weights) {
+                std::cerr << "Error: Text input requires weights directory to locate tokenizer files" << std::endl;
+                std::cerr << "Usage: " << argv[0] << " \"text\" <weights_dir> [output_file.bin] [max_tokens]" << std::endl;
+                return 1;
+            }
+            
+            // Try to locate tokenizer files
+            std::string tokenizer_dir = weights_dir + "/tokenizer";
+            std::string vocab_path = tokenizer_dir + "/vocab.json";
+            std::string merges_path = tokenizer_dir + "/merges.txt";
+            
+            // Check if tokenizer files exist in tokenizer subdirectory
+            std::ifstream vocab_test(vocab_path);
+            std::ifstream merges_test(merges_path);
+            
+            if (!vocab_test.good() || !merges_test.good()) {
+                // Try weights_dir directly
+                vocab_path = weights_dir + "/vocab.json";
+                merges_path = weights_dir + "/merges.txt";
+                vocab_test.close();
+                merges_test.close();
+                
+                vocab_test.open(vocab_path);
+                merges_test.open(merges_path);
+                
+                if (!vocab_test.good() || !merges_test.good()) {
+                    vocab_test.close();
+                    merges_test.close();
+                    std::cerr << "Error: Tokenizer files not found. Expected:" << std::endl;
+                    std::cerr << "  " << tokenizer_dir << "/vocab.json" << std::endl;
+                    std::cerr << "  " << tokenizer_dir << "/merges.txt" << std::endl;
+                    std::cerr << "Or:" << std::endl;
+                    std::cerr << "  " << weights_dir << "/vocab.json" << std::endl;
+                    std::cerr << "  " << weights_dir << "/merges.txt" << std::endl;
+                    std::cerr << std::endl;
+                    std::cerr << "Please download tokenizer files from Hugging Face model or use binary token file input." << std::endl;
+                    return 1;
+                }
+            }
+            vocab_test.close();
+            merges_test.close();
+            
+            // Load and use tokenizer
+            std::cout << "Loading tokenizer from: " << vocab_path << " and " << merges_path << std::endl;
+            BPETokenizer tokenizer;
+            if (!tokenizer.loadFromFiles(vocab_path, merges_path)) {
+                std::cerr << "Error: Failed to load tokenizer files" << std::endl;
+                return 1;
+            }
+            std::cout << "✓ Tokenizer loaded (vocab size: " << tokenizer.getVocabSize() << ")" << std::endl;
+            
+            // Tokenize text
+            std::cout << "Tokenizing text..." << std::endl;
+            prompt_tokens = tokenizer.tokenize(input_arg);
+            
+            if (prompt_tokens.empty()) {
+                std::cerr << "Error: Tokenization failed or produced no tokens" << std::endl;
+                return 1;
+            }
+            
+            std::cout << "Tokenized to " << prompt_tokens.size() << " tokens: [";
+            for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+                std::cout << prompt_tokens[i];
+                if (i < prompt_tokens.size() - 1) std::cout << ", ";
+            }
+            std::cout << "]" << std::endl;
         }
-        std::cout << "]" << std::endl;
         
         // Initialize OpenCL first (needed for vocab size check)
         std::cout << "Initializing OpenCL..." << std::endl;
@@ -342,7 +422,8 @@ int main(int argc, char* argv[]) {
         std::cout << "✓ Embedding layer initialized (" << (ACTUAL_VOCAB_SIZE * ACTUAL_D_MODEL * sizeof(float) / 1024 / 1024) << " MB)" << std::endl;
         
         // Sequence model
-        SequenceModel seq_model(&ctx_mgr, ACTUAL_D_MODEL, n_layer_repeats, false);
+        // Mamba2-130m uses post_norm = true (based on MLX model configuration)
+        SequenceModel seq_model(&ctx_mgr, ACTUAL_D_MODEL, n_layer_repeats, true);
         
         // Build model
         // Pattern: 12 unique layers repeated n_layer_repeats times
@@ -716,133 +797,21 @@ int main(int argc, char* argv[]) {
             }
         };
         
-        // Create all layers (12 unique layers × n_layer_repeats)
+        // Create all layers (for mamba2-130m: all 24 layers are SSD)
         int layer_count = 0;
-        std::cout << "Starting layer creation loop (will create " << (12 * n_layer_repeats) << " layers)..." << std::endl;
-        for (int repeat = 0; repeat < n_layer_repeats; ++repeat) {
-            std::cout << "  Repeat " << (repeat + 1) << " of " << n_layer_repeats << "..." << std::endl;
-            // Layer 0: SSD
-            {
-                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
-                ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, ACTUAL_D_MODEL, "pre", true);
-                loadNormWeights(block, layer_count, true);
-                seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
-                layer_count++;
-            }
+        std::cout << "Starting layer creation (will create " << N_LAYER << " SSD layers)..." << std::endl;
+        
+        // For mamba2-130m: all layers are SSD (no SwiGLU or Attention)
+        for (int i = 0; i < N_LAYER; ++i) {
+            SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
+            ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, ACTUAL_D_MODEL, "pre", true);
+            loadNormWeights(block, layer_count, true);
+            seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
+            layer_count++;
             
-            // Layer 1: SSD
-            {
-                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
-                ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, ACTUAL_D_MODEL, "pre", true);
-                loadNormWeights(block, layer_count, true);
-                seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
-                layer_count++;
-            }
-            
-            // Layer 2: SwiGLU
-            {
-                SwiGLULayer* layer = createSwiGLULayer(layer_count, SSD_EXPAND);
-                ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, ACTUAL_D_MODEL, "pre", false);
-                loadNormWeights(block, layer_count, false);
-                seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
-                layer_count++;
-            }
-            
-            // Layer 3: SSD
-            {
-                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
-                ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, ACTUAL_D_MODEL, "pre", true);
-                loadNormWeights(block, layer_count, true);
-                seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
-                layer_count++;
-            }
-            
-            // Layer 4: SSD
-            {
-                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
-                ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, ACTUAL_D_MODEL, "pre", true);
-                loadNormWeights(block, layer_count, true);
-                seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
-                layer_count++;
-            }
-            
-            // Layer 5: SwiGLU
-            {
-                SwiGLULayer* layer = createSwiGLULayer(layer_count, SSD_EXPAND);
-                ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, ACTUAL_D_MODEL, "pre", false);
-                loadNormWeights(block, layer_count, false);
-                seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
-                layer_count++;
-            }
-            
-            // Layer 6: Attention
-            {
-                std::cout << "  Creating Attention layer " << layer_count << "..." << std::flush;
-                try {
-                    AttentionLayer* layer = createAttentionLayer(layer_count);
-                    std::cout << " ✓" << std::endl;
-                    std::cout << "  Creating ResidualBlock for Attention..." << std::flush;
-                    ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, ACTUAL_D_MODEL, "pre", true);
-                    loadNormWeights(block, layer_count, false);
-                    std::cout << " ✓" << std::endl;
-                    std::cout << "  Adding Attention layer to sequence model..." << std::flush;
-                    seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
-                    std::cout << " ✓" << std::endl;
-                    layer_count++;
-                } catch (const std::exception& e) {
-                    std::cerr << "\n  ERROR creating Attention layer: " << e.what() << std::endl;
-                    throw;
-                }
-            }
-            
-            // Layer 7: SSD
-            {
-                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
-                ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, ACTUAL_D_MODEL, "pre", true);
-                loadNormWeights(block, layer_count, true);
-                seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
-                layer_count++;
-            }
-            
-            // Layer 8: SwiGLU
-            {
-                SwiGLULayer* layer = createSwiGLULayer(layer_count, SSD_EXPAND);
-                ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, ACTUAL_D_MODEL, "pre", false);
-                loadNormWeights(block, layer_count, false);
-                seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
-                layer_count++;
-            }
-            
-            // Layer 9: SSD
-            {
-                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
-                ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, ACTUAL_D_MODEL, "pre", true);
-                loadNormWeights(block, layer_count, true);
-                seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
-                layer_count++;
-            }
-            
-            // Layer 10: SSD
-            {
-                SSDLayer* layer = createSSDLayer(layer_count, SSD_EXPAND, SSD_KERNEL_SIZE, SSD_D_STATE, SSD_D_HEAD, SSD_N_GROUPS);
-                ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, ACTUAL_D_MODEL, "pre", true);
-                loadNormWeights(block, layer_count, true);
-                seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
-                layer_count++;
-            }
-            
-            // Layer 11: SwiGLU
-            {
-                SwiGLULayer* layer = createSwiGLULayer(layer_count, SSD_EXPAND);
-                ResidualBlock* block = new ResidualBlock(&ctx_mgr, layer, ACTUAL_D_MODEL, "pre", false);
-                loadNormWeights(block, layer_count, false);
-                seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
-                layer_count++;
-            }
-            
-            if ((repeat + 1) % 1 == 0) {
-                std::cout << "  Added " << (repeat + 1) << " repeats (" << layer_count << " layers)..." << std::endl;
-                std::cout.flush();  // Force output
+            if ((i + 1) % 4 == 0 || (i + 1) == N_LAYER) {
+                std::cout << "  Added " << (i + 1) << " layers..." << std::endl;
+                std::cout.flush();
             }
         }
         
@@ -923,28 +892,75 @@ int main(int argc, char* argv[]) {
     cl_mem hidden = seq_model.forward(embeddings, batch_size, seq_len, &states, queue, output_base);
     std::cout << " ✓" << std::endl;
     
+    // Check hidden state for NaN before LM head (after post-norm if applied)
+    size_t hidden_size = batch_size * seq_len * ACTUAL_D_MODEL;
+    checkForNaN(hidden, hidden_size, queue, "hidden_state_prefill_after_postnorm");
+    
     // Step 3: Get logits from last token and sample first generation token
     std::cout << "  Step 3: Computing logits from last token..." << std::flush;
-    // LMHead expects [batch_size, d_model] as input and outputs [batch_size, vocab_size]
-    // Since seq_model outputs [batch_size, seq_len, d_model], we treat all tokens as a batch
-    int effective_batch_size = batch_size * seq_len;
-    cl_mem prefill_logits = lm_head.forward(hidden, effective_batch_size, queue);
+    // Match MLX: extract last token first, then apply LM head
+    // hidden is [batch_size, seq_len, d_model] = [1, seq_len, d_model]
+    // Extract last token: [batch_size, d_model] = [1, d_model]
+    size_t last_token_hidden_offset = (seq_len - 1) * ACTUAL_D_MODEL;
+    std::vector<float> last_token_hidden(ACTUAL_D_MODEL);
+    cl_int err = clEnqueueReadBuffer(queue, hidden, CL_TRUE, 
+                                     last_token_hidden_offset * sizeof(float),
+                                     ACTUAL_D_MODEL * sizeof(float),
+                                     last_token_hidden.data(), 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to read last token hidden state");
+    }
+    
+    // Debug: Check last token hidden state statistics and dump for comparison
+    static bool debug_hidden = true;
+    if (debug_hidden) {
+        float min_h = *std::min_element(last_token_hidden.begin(), last_token_hidden.end());
+        float max_h = *std::max_element(last_token_hidden.begin(), last_token_hidden.end());
+        float sum_h = std::accumulate(last_token_hidden.begin(), last_token_hidden.end(), 0.0f);
+        float mean_h = sum_h / last_token_hidden.size();
+        std::cout << "\n  [Debug] Last token hidden state: min=" << min_h 
+                  << ", max=" << max_h << ", mean=" << mean_h << std::endl;
+        std::cout << "  [Debug] First 10 values: ";
+        for (int i = 0; i < 10 && i < ACTUAL_D_MODEL; ++i) {
+            std::cout << last_token_hidden[i] << " ";
+        }
+        std::cout << std::endl;
+        
+        // Dump hidden state for comparison with MLX
+        std::string hidden_file = output_base + "_prefill_last_token_hidden.bin";
+        std::ofstream hidden_out(hidden_file, std::ios::binary);
+        if (hidden_out.is_open()) {
+            hidden_out.write(reinterpret_cast<const char*>(last_token_hidden.data()), 
+                            last_token_hidden.size() * sizeof(float));
+            hidden_out.close();
+            std::cout << "  [Debug] Dumped last token hidden state to " << hidden_file << std::endl;
+        }
+        debug_hidden = false;
+    }
+    
+    // Create a buffer for the last token hidden state
+    cl_mem last_token_hidden_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                                   ACTUAL_D_MODEL * sizeof(float),
+                                                   last_token_hidden.data(), &err);
+    if (err != CL_SUCCESS || !last_token_hidden_buf) {
+        throw std::runtime_error("Failed to create last token hidden state buffer");
+    }
+    
+    // Apply LM head to last token only (batch_size=1)
+    cl_mem prefill_logits = lm_head.forward(last_token_hidden_buf, batch_size, queue);
     std::cout << " ✓" << std::endl;
     
-    // Extract logits for the last token in the sequence
-    // The LM head outputs [batch_size * seq_len, vocab_size]
-    std::vector<float> all_logits(effective_batch_size * ACTUAL_VOCAB_SIZE);
-    cl_int err = clEnqueueReadBuffer(queue, prefill_logits, CL_TRUE, 0, 
-                                     all_logits.size() * sizeof(float), 
-                                     all_logits.data(), 0, nullptr, nullptr);
+    // Read logits for the last token
+    std::vector<float> last_token_logits(ACTUAL_VOCAB_SIZE);
+    err = clEnqueueReadBuffer(queue, prefill_logits, CL_TRUE, 0,
+                              ACTUAL_VOCAB_SIZE * sizeof(float),
+                              last_token_logits.data(), 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
         throw std::runtime_error("Failed to read prefill logits from device");
     }
     
-    // Get last token's logits (last position in the effective batch)
-    size_t last_token_offset = (seq_len - 1) * ACTUAL_VOCAB_SIZE;
-    std::vector<float> last_token_logits(all_logits.begin() + last_token_offset, 
-                                         all_logits.begin() + last_token_offset + ACTUAL_VOCAB_SIZE);
+    // Release the temporary buffer
+    clReleaseMemObject(last_token_hidden_buf);
     
     // Dump prefill logits for comparison (match MLX naming)
     std::string prefill_logits_file = output_base + "_prefill_logits.bin";
@@ -1021,8 +1037,9 @@ int main(int argc, char* argv[]) {
                 }
                 std::cout.flush();
                 
-                // Step through sequence model
-                next_hidden = seq_model.step(current_embedding, batch_size, &states, queue);
+                // Step through sequence model (pass output_base for layer dumping on first step only)
+                std::string step_output_prefix = (i == 0 && !output_base.empty()) ? output_base : "";
+                next_hidden = seq_model.step(current_embedding, batch_size, &states, queue, step_output_prefix);
                 if (!next_hidden) throw std::runtime_error("seq_model.step returned null buffer");
                 std::cout << "  [Gen] seq_model.step ✓" << std::endl;
                 

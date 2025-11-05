@@ -78,43 +78,11 @@ __kernel void swish(
     
     float x = input[idx];
     
-    // Clamp input to prevent Inf/NaN
-    if (isnan(x) || isinf(x)) {
-        output[idx] = 0.0f;
-        return;
-    }
+    // Compute sigmoid: 1 / (1 + exp(-x)) - match MLX exactly (no clamping)
+    float sigmoid_x = 1.0f / (1.0f + exp(-x));
     
-    // Clamp to reasonable range to prevent exp overflow
-    const float max_val = 50.0f;  // exp(-50) is very close to 0, safe for sigmoid
-    const float min_val = -50.0f;  // exp(50) would overflow, but we use exp(-x) so -50 means exp(50)
-    if (x > max_val) x = max_val;
-    if (x < min_val) x = min_val;
-    
-    // Compute sigmoid with overflow protection
-    // For large negative x, exp(-x) can overflow, so use: 1 / (1 + exp(-x)) ≈ 0
-    // For large positive x, exp(-x) ≈ 0, so sigmoid ≈ 1
-    float sigmoid_x;
-    if (x < -50.0f) {
-        sigmoid_x = 0.0f;
-    } else if (x > 50.0f) {
-        sigmoid_x = 1.0f;
-    } else {
-        float exp_val = exp(-x);
-        if (isinf(exp_val) || isnan(exp_val)) {
-            // Overflow protection
-            sigmoid_x = (x < 0.0f) ? 0.0f : 1.0f;
-        } else {
-            sigmoid_x = 1.0f / (1.0f + exp_val);
-        }
-    }
-    
-    // Compute swish: x * sigmoid(x)
+    // Compute swish: x * sigmoid(x) - match MLX exactly
     output[idx] = x * sigmoid_x;
-    
-    // Final check
-    if (isnan(output[idx]) || isinf(output[idx])) {
-        output[idx] = 0.0f;
-    }
 }
 
 // SwiGLU: (Swish(gate) * up) 
@@ -128,31 +96,8 @@ __kernel void swiglu_combine(
     const int idx = get_global_id(0);
     if (idx >= size) return;
     
-    float gate_val = gate[idx];
-    float up_val = up[idx];
-    
-    // Check for Inf/NaN and clamp
-    if (isnan(gate_val) || isinf(gate_val)) {
-        gate_val = 0.0f;
-    }
-    if (isnan(up_val) || isinf(up_val)) {
-        up_val = 0.0f;
-    }
-    
-    // Clamp to prevent overflow
-    const float max_val = 1e10f;
-    const float min_val = -1e10f;
-    if (gate_val > max_val) gate_val = max_val;
-    if (gate_val < min_val) gate_val = min_val;
-    if (up_val > max_val) up_val = max_val;
-    if (up_val < min_val) up_val = min_val;
-    
-    output[idx] = gate_val * up_val;
-    
-    // Final check
-    if (isnan(output[idx]) || isinf(output[idx])) {
-        output[idx] = 0.0f;
-    }
+    // SwiGLU combine: gate * up (match MLX exactly, no clamping)
+    output[idx] = gate[idx] * up[idx];
 }
 )";
     

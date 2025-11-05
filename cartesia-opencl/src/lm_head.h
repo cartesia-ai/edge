@@ -33,8 +33,10 @@ private:
     int d_model_;
     int vocab_size_;
     
-    // Weights buffer [vocab_size x d_model] (transposed for matmul)
-    cl_mem weights_buffer_;
+    // Weights buffers split into chunks to fit device memory limits
+    std::vector<cl_mem> weights_buffers_;  // Multiple chunks
+    int chunk_size_;                        // Vocab tokens per chunk
+    int num_chunks_;                        // Number of chunks
     bool weights_initialized_;
     
     // Output buffer

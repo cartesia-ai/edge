@@ -105,6 +105,11 @@ private:
     cl_kernel conv_forward_kernel_;
     cl_kernel conv_update_kernel_;
     
+    // Helper kernels
+    cl_kernel split_in_proj_kernel_;
+    cl_kernel gate_kernel_;
+    cl_kernel copy_channels_kernel_;
+    
     // SSM forward kernels (for prefill, GPU-based)
     cl_kernel process_dt_kernel_;
     cl_kernel compute_dtA_kernel_;
