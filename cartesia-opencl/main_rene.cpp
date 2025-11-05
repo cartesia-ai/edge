@@ -21,6 +21,8 @@
 #include <cstdlib>
 #include <ctime>
 #include <cmath>
+#include <numeric>
+#include <algorithm>
 
 using namespace cartesia_opencl;
 
@@ -186,10 +188,10 @@ int main(int argc, char* argv[]) {
         
         bool use_pretrained_weights = !weights_dir.empty();
         
-        // Use config from model_config.h (now set to Rene dimensions)
+        // Use config from model_config.h (reduced for Android device memory)
         const int ACTUAL_VOCAB_SIZE = VOCAB_SIZE;  // 50288
-        const int ACTUAL_D_MODEL = D_MODEL;         // 2048
-        int n_layer_repeats = N_LAYER_REPEATS;      // 4
+        const int ACTUAL_D_MODEL = D_MODEL;         // 1024 (reduced from 2048)
+        int n_layer_repeats = N_LAYER_REPEATS;      // 1
         
         if (use_pretrained_weights) {
             std::cout << "Loading pretrained Rene weights from: " << weights_dir << std::endl;
@@ -259,7 +261,7 @@ int main(int argc, char* argv[]) {
         std::cout << "✓ Embedding layer initialized (" << (ACTUAL_VOCAB_SIZE * ACTUAL_D_MODEL * sizeof(float) / 1024 / 1024) << " MB)" << std::endl;
         
         // Sequence model
-        SequenceModel seq_model(&ctx_mgr, D_MODEL, n_layer_repeats, false);
+        SequenceModel seq_model(&ctx_mgr, ACTUAL_D_MODEL, n_layer_repeats, false);
         
         // Build model
         // Pattern: 12 unique layers repeated n_layer_repeats times
@@ -534,19 +536,19 @@ int main(int argc, char* argv[]) {
         
         // LM Head
         std::cout << "Initializing LM Head..." << std::flush;
-        LMHead lm_head(&ctx_mgr, D_MODEL, ACTUAL_VOCAB_SIZE);
+        LMHead lm_head(&ctx_mgr, ACTUAL_D_MODEL, ACTUAL_VOCAB_SIZE);
         std::cout << " ✓ (created)" << std::endl;
         
         std::vector<float> lm_weights;
         if (use_pretrained_weights) {
             std::cout << "  Loading LM Head weights..." << std::flush;
             lm_weights = loadWeights(weights_dir + "/lm_head_weight.bin");
-            if (lm_weights.size() != (size_t)(ACTUAL_VOCAB_SIZE * D_MODEL)) {
+            if (lm_weights.size() != (size_t)(ACTUAL_VOCAB_SIZE * ACTUAL_D_MODEL)) {
                 throw std::runtime_error("LM head weight size mismatch");
             }
         } else {
             std::cout << "  Generating LM Head weights..." << std::flush;
-            lm_weights.resize(ACTUAL_VOCAB_SIZE * D_MODEL);
+            lm_weights.resize(ACTUAL_VOCAB_SIZE * ACTUAL_D_MODEL);
             for (float& w : lm_weights) {
                 w = 0.01f * (std::rand() % 200 - 100) / 100.0f;
             }
@@ -556,7 +558,7 @@ int main(int argc, char* argv[]) {
         std::cout << "  Initializing LM Head..." << std::flush;
         lm_head.initializeWeights(lm_weights);
         std::cout << " ✓" << std::endl;
-        std::cout << "✓ LM Head initialized (" << (ACTUAL_VOCAB_SIZE * D_MODEL * sizeof(float) / 1024 / 1024) << " MB)" << std::endl;
+        std::cout << "✓ LM Head initialized (" << (ACTUAL_VOCAB_SIZE * ACTUAL_D_MODEL * sizeof(float) / 1024 / 1024) << " MB)" << std::endl;
         
         // Sampler
         Sampler sampler;
@@ -623,6 +625,28 @@ int main(int argc, char* argv[]) {
     std::vector<float> last_token_logits(all_logits.begin() + last_token_offset, 
                                          all_logits.begin() + last_token_offset + ACTUAL_VOCAB_SIZE);
     
+    // Dump prefill logits for comparison
+    std::string prefill_logits_file = output_file;
+    size_t bin_pos = prefill_logits_file.find(".bin");
+    if (bin_pos != std::string::npos) {
+        prefill_logits_file.replace(bin_pos, 4, "_prefill_logits.bin");
+    } else {
+        prefill_logits_file += "_prefill_logits.bin";
+    }
+    std::ofstream prefill_logits_out(prefill_logits_file, std::ios::binary);
+    if (prefill_logits_out.is_open()) {
+        prefill_logits_out.write(reinterpret_cast<const char*>(last_token_logits.data()), 
+                                 last_token_logits.size() * sizeof(float));
+        prefill_logits_out.close();
+        std::cout << "\n  [Debug] Dumped prefill logits to " << prefill_logits_file << std::endl;
+    }
+    float min_logit = *std::min_element(last_token_logits.begin(), last_token_logits.end());
+    float max_logit = *std::max_element(last_token_logits.begin(), last_token_logits.end());
+    float sum_logit = std::accumulate(last_token_logits.begin(), last_token_logits.end(), 0.0f);
+    float mean_logit = sum_logit / last_token_logits.size();
+    std::cout << "  [Debug] Prefill logits stats: min=" << min_logit << ", max=" << max_logit 
+              << ", mean=" << mean_logit << std::endl;
+    
     // Sample first token from prefill logits
     std::cout << "  Step 4: Sampling first token from prefill logits..." << std::flush;
     int current_token_id = sampler.topPSample(last_token_logits, DEFAULT_TOP_P, DEFAULT_TEMPERATURE);
@@ -682,6 +706,35 @@ int main(int argc, char* argv[]) {
                 clFinish(queue);
                 std::cout << "  [Gen] clFinish ✓" << std::endl;
                 std::cout.flush();
+                
+                // Read logits for dumping
+                std::vector<float> gen_logits(ACTUAL_VOCAB_SIZE);
+                cl_int read_err = clEnqueueReadBuffer(queue, logits, CL_TRUE, 0,
+                    ACTUAL_VOCAB_SIZE * sizeof(float), gen_logits.data(), 0, nullptr, nullptr);
+                
+                if (read_err == CL_SUCCESS) {
+                    // Dump generation step logits for comparison
+                    std::string gen_logits_file = output_file;
+                    size_t bin_pos = gen_logits_file.find(".bin");
+                    if (bin_pos != std::string::npos) {
+                        gen_logits_file.replace(bin_pos, 4, "_gen_step_" + std::to_string(i) + "_logits.bin");
+                    } else {
+                        gen_logits_file += "_gen_step_" + std::to_string(i) + "_logits.bin";
+                    }
+                    std::ofstream gen_logits_out(gen_logits_file, std::ios::binary);
+                    if (gen_logits_out.is_open()) {
+                        gen_logits_out.write(reinterpret_cast<const char*>(gen_logits.data()),
+                                           gen_logits.size() * sizeof(float));
+                        gen_logits_out.close();
+                        std::cout << "  [Debug] Dumped gen step " << i << " logits to " << gen_logits_file << std::endl;
+                    }
+                    float min_logit = *std::min_element(gen_logits.begin(), gen_logits.end());
+                    float max_logit = *std::max_element(gen_logits.begin(), gen_logits.end());
+                    float sum_logit = std::accumulate(gen_logits.begin(), gen_logits.end(), 0.0f);
+                    float mean_logit = sum_logit / gen_logits.size();
+                    std::cout << "  [Debug] Gen step " << i << " logits stats: min=" << min_logit 
+                              << ", max=" << max_logit << ", mean=" << mean_logit << std::endl;
+                }
                 
                 // Sample next token
                 int next_token = sampler.sampleFromBuffer(
