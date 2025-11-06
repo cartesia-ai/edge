@@ -1,4 +1,5 @@
 #include "sampling.h"
+#include "debug.h"
 #include <algorithm>
 #include <numeric>
 #include <cmath>
@@ -138,25 +139,13 @@ int Sampler::sampleFromBuffer(
         throw std::runtime_error("Failed to read logits from buffer");
     }
     
-    // Debug: Check logits statistics (first time only)
-    static bool first_sample = true;
-    if (first_sample) {
-        float min_logit = logits[0], max_logit = logits[0], sum_logit = 0.0f;
-        for (float l : logits) {
-            min_logit = std::min(min_logit, l);
-            max_logit = std::max(max_logit, l);
-            sum_logit += l;
-        }
-        float mean_logit = sum_logit / logits.size();
-        std::cout << "  [Sampling Debug] logits: min=" << min_logit 
-                  << ", max=" << max_logit << ", mean=" << mean_logit << std::endl;
-        std::cout << "  [Sampling Debug] first 10 logits: ";
+    DEBUG_LOGITS({
+        std::cout << "  [Sampling] First 10 logits: ";
         for (int i = 0; i < 10 && i < vocab_size; ++i) {
             std::cout << logits[i] << " ";
         }
         std::cout << std::endl;
-        first_sample = false;
-    }
+    });
     
     // Sample
     if (top_p > 0.0f && top_p < 1.0f) {

@@ -67,7 +67,6 @@ SSDLayer::SSDLayer(
     size_t ssm_params = n_heads_ + n_heads_ + n_heads_;  // A, dt_bias, D
     size_t total_params = in_proj_params + conv_params + out_proj_params + ssm_params + conv_dim_; // + conv_bias
     size_t buffer_size_mb = (total_params * sizeof(float)) / (1024 * 1024);
-    // std::cout << "  [SSD] d_model=" << d_model_
     //           << ", expand=" << (d_inner_ / d_model_)
     //           << ", d_inner=" << d_inner_
     //           << ", kernel_size=" << kernel_size_
@@ -608,9 +607,7 @@ __kernel void compute_ssm_output_kernel(
             clFinish(queue);
         }
         
-        std::cout << "[SSDLayer] Building OpenCL program with " << core_sources.size() << " core source(s)..." << std::flush;
     program_ = ctx_mgr.buildProgram(core_sources, cache_key);
-        std::cout << " ✓" << std::endl;
         
         // Verify program was created
         if (!program_) {
@@ -622,18 +619,13 @@ __kernel void compute_ssm_output_kernel(
         cl_int err = clGetProgramBuildInfo(program_, ctx_mgr.getDevice(), CL_PROGRAM_BUILD_STATUS, 
                                           sizeof(cl_build_status), &build_status, nullptr);
         if (err == CL_SUCCESS) {
-            if (build_status == CL_BUILD_SUCCESS) {
-                std::cout << "[SSDLayer] Program build successful" << std::endl;
-            } else {
-                std::cerr << "[SSDLayer] Warning: Program build status = " << build_status << std::endl;
+            if (build_status != CL_BUILD_SUCCESS) {
             }
         }
     } catch (const std::exception& e) {
-        std::cerr << "[SSDLayer] Error building program: " << e.what() << std::endl;
         program_ = nullptr;  // Ensure it's null
         throw;
     } catch (...) {
-        std::cerr << "[SSDLayer] Unknown error building program" << std::endl;
         program_ = nullptr;
         throw std::runtime_error("Unknown error building OpenCL program");
     }
@@ -658,31 +650,21 @@ __kernel void compute_ssm_output_kernel(
     }
     
     try {
-        std::cout << "[SSDLayer] Creating required kernels..." << std::flush;
-        
         // Create kernels one at a time to isolate any driver crashes
-        std::cout << "\n  [SSDLayer] Creating conv_forward_kernel..." << std::flush;
-    conv_forward_kernel_ = ctx_mgr.getKernel(program_, "conv1d_forward_kernel");
+        conv_forward_kernel_ = ctx_mgr.getKernel(program_, "conv1d_forward_kernel");
         if (!conv_forward_kernel_) {
             throw std::runtime_error("Failed to create conv_forward_kernel (returned null)");
         }
-        std::cout << " ✓" << std::flush;
         
-        std::cout << "\n  [SSDLayer] Creating conv_update_kernel..." << std::flush;
-    conv_update_kernel_ = ctx_mgr.getKernel(program_, "conv1d_update_kernel");
+        conv_update_kernel_ = ctx_mgr.getKernel(program_, "conv1d_update_kernel");
         if (!conv_update_kernel_) {
             throw std::runtime_error("Failed to create conv_update_kernel (returned null)");
         }
-        std::cout << " ✓" << std::flush;
         
-        std::cout << "\n  [SSDLayer] Creating ssm_kernel..." << std::flush;
-    ssm_kernel_ = ctx_mgr.getKernel(program_, "ssm_update_kernel");
+        ssm_kernel_ = ctx_mgr.getKernel(program_, "ssm_update_kernel");
         if (!ssm_kernel_) {
             throw std::runtime_error("Failed to create ssm_kernel (returned null)");
         }
-        std::cout << " ✓" << std::flush;
-        
-        std::cout << "\n[SSDLayer] Core kernels created successfully" << std::endl;
         
         // Build helper kernels separately (split and gate) to avoid PowerVR driver crashes
         // If building fails, we'll use CPU fallback
@@ -690,48 +672,20 @@ __kernel void compute_ssm_output_kernel(
             std::vector<std::string> helper_sources = {std::string(helper_kernels_source)};
             std::string helper_cache_key = ctx_mgr.generateCacheKey(helper_sources) + "_helper";
             
-            std::cout << "[SSDLayer] Building helper kernels program..." << std::flush;
             cl_program helper_program = ctx_mgr.buildProgram(helper_sources, helper_cache_key);
-            std::cout << " ✓" << std::flush;
             
             if (helper_program) {
-                std::cout << "\n  [SSDLayer] Creating split_in_proj_kernel..." << std::flush;
                 split_in_proj_kernel_ = ctx_mgr.getKernel(helper_program, "split_in_proj_kernel");
-                if (split_in_proj_kernel_) {
-                    std::cout << " ✓" << std::flush;
-                } else {
-                    std::cout << " ✗ (null)" << std::flush;
-                }
-                
-                std::cout << "\n  [SSDLayer] Creating gate_kernel..." << std::flush;
                 gate_kernel_ = ctx_mgr.getKernel(helper_program, "gate_kernel");
-                if (gate_kernel_) {
-                    std::cout << " ✓" << std::flush;
-                } else {
-                    std::cout << " ✗ (null)" << std::flush;
-                }
-                
-                std::cout << "\n  [SSDLayer] Creating copy_channels_kernel..." << std::flush;
                 copy_channels_kernel_ = ctx_mgr.getKernel(helper_program, "copy_channels_kernel");
-                if (copy_channels_kernel_) {
-                    std::cout << " ✓" << std::flush;
-                } else {
-                    std::cout << " ✗ (null)" << std::flush;
-                }
                 
                 // Release helper program (kernels are retained)
                 clReleaseProgram(helper_program);
-                
-                std::cout << "\n[SSDLayer] Helper kernels created" << std::endl;
             } else {
-                std::cerr << "\n[SSDLayer] Warning: Helper program is null, will use CPU fallback for split/gate" << std::endl;
             }
         } catch (const std::exception& e) {
-            std::cerr << "\n[SSDLayer] Warning: Failed to build helper kernels (will use CPU fallback): " << e.what() << std::endl;
             // Keep kernels as nullptr - functions will check and use CPU fallback
         } catch (...) {
-            std::cerr << "\n[SSDLayer] Warning: Unknown error building helper kernels (possible driver crash)" << std::endl;
-            std::cerr << "[SSDLayer] Will use CPU fallback for split and gate operations" << std::endl;
             // Keep kernels as nullptr
         }
         
@@ -739,8 +693,6 @@ __kernel void compute_ssm_output_kernel(
         // WARNING: PowerVR OpenCL driver crashes (segfault) when building these kernels
         // This is a known driver bug. We skip them entirely to avoid crashes.
         // The model will use CPU fallback for prefill SSM computation.
-        std::cout << "[SSDLayer] Skipping SSM forward kernels (PowerVR driver bug causes segfault)" << std::endl;
-        std::cout << "[SSDLayer] Will use CPU fallback for prefill SSM computation" << std::endl;
         
         // DO NOT attempt to build SSM forward kernels on PowerVR - it causes driver crash
         // Uncomment below to test on other drivers, but keep commented for PowerVR
@@ -749,49 +701,32 @@ __kernel void compute_ssm_output_kernel(
             std::vector<std::string> ssm_forward_sources = {std::string(ssm_forward_cl_source)};
             std::string ssm_forward_cache_key = ctx_mgr.generateCacheKey(ssm_forward_sources) + "_ssm_forward";
             
-            std::cout << "\n  [SSDLayer] Building SSM forward program..." << std::flush;
             cl_program ssm_forward_program = ctx_mgr.buildProgram(ssm_forward_sources, ssm_forward_cache_key);
-            std::cout << " ✓" << std::flush;
             
             if (ssm_forward_program) {
-                std::cout << "\n  [SSDLayer] Creating process_dt_kernel..." << std::flush;
                 process_dt_kernel_ = ctx_mgr.getKernel(ssm_forward_program, "process_dt_kernel");
-                std::cout << " ✓" << std::flush;
                 
-                std::cout << "\n  [SSDLayer] Creating compute_dtA_kernel..." << std::flush;
                 compute_dtA_kernel_ = ctx_mgr.getKernel(ssm_forward_program, "compute_dtA_kernel");
-                std::cout << " ✓" << std::flush;
                 
-                std::cout << "\n  [SSDLayer] Creating compute_segsum_decay_kernel..." << std::flush;
                 compute_segsum_decay_kernel_ = ctx_mgr.getKernel(ssm_forward_program, "compute_segsum_decay_kernel");
-                std::cout << " ✓" << std::flush;
                 
-                std::cout << "\n  [SSDLayer] Creating compute_CB_kernel..." << std::flush;
                 compute_CB_kernel_ = ctx_mgr.getKernel(ssm_forward_program, "compute_CB_kernel");
-                std::cout << " ✓" << std::flush;
                 
-                std::cout << "\n  [SSDLayer] Creating compute_ssm_output_kernel..." << std::flush;
                 compute_ssm_output_kernel_ = ctx_mgr.getKernel(ssm_forward_program, "compute_ssm_output_kernel");
-                std::cout << " ✓" << std::flush;
                 
                 // Store the program for cleanup (we'll need to add a member variable for this)
                 // For now, we'll just keep the kernels and release the program
                 clReleaseProgram(ssm_forward_program);
                 
-                std::cout << "\n[SSDLayer] All SSM forward kernels created successfully" << std::endl;
             } else {
-                std::cerr << "\n[SSDLayer] Warning: SSM forward program is null" << std::endl;
             }
         } catch (const std::exception& e) {
-            std::cerr << "\n[SSDLayer] Warning: Failed to create SSM forward kernels (will use CPU fallback): " << e.what() << std::endl;
             // Keep kernels as nullptr - forward() will check and use CPU fallback
         } catch (...) {
-            std::cerr << "\n[SSDLayer] Warning: Unknown error creating SSM forward kernels (possible driver crash)" << std::endl;
             // Keep kernels as nullptr
         }
         */
     } catch (const std::exception& e) {
-        std::cerr << "[SSDLayer] Error creating kernels: " << e.what() << std::endl;
         // Clean up what we created - but be very careful about order
         // Release kernels first, then program
         if (process_dt_kernel_) { 
@@ -899,30 +834,6 @@ void SSDLayer::initializeWeights(
     cl_context context = ctx_->getContext();
     cl_int err;
     
-    // Debug: Check weights before creating buffer (only first layer)
-    static int weight_init_debug = 0;
-    weight_init_debug++;
-    if (weight_init_debug == 1) {
-        float w_min = conv_weight[0], w_max = conv_weight[0], w_sum = 0.0f;
-        for (size_t i = 0; i < std::min(conv_weight.size(), size_t(1000)); ++i) {
-            w_min = std::min(w_min, conv_weight[i]);
-            w_max = std::max(w_max, conv_weight[i]);
-            w_sum += conv_weight[i];
-        }
-        float b_min = conv_bias[0], b_max = conv_bias[0], b_sum = 0.0f;
-        for (size_t i = 0; i < std::min(conv_bias.size(), size_t(100)); ++i) {
-            b_min = std::min(b_min, conv_bias[i]);
-            b_max = std::max(b_max, conv_bias[i]);
-            b_sum += conv_bias[i];
-        }
-        std::cout << "[Weight Init Debug] conv_weight before buffer: min=" << w_min << ", max=" << w_max 
-                  << ", mean=" << (w_sum / std::min(conv_weight.size(), size_t(1000))) << std::endl;
-        std::cout << "[Weight Init Debug] conv_bias before buffer: min=" << b_min << ", max=" << b_max 
-                  << ", mean=" << (b_sum / std::min(conv_bias.size(), size_t(100))) << std::endl;
-        std::cout << "[Weight Init Debug] First few conv_weight values: " << conv_weight[0] << " " 
-                  << conv_weight[1] << " " << conv_weight[2] << " " << conv_weight[3] << std::endl;
-    }
-    
     conv_weight_ = clCreateBuffer(
         context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         conv_weight.size() * sizeof(float), (void*)conv_weight.data(), &err
@@ -935,22 +846,6 @@ void SSDLayer::initializeWeights(
     );
     if (err != CL_SUCCESS) throw std::runtime_error("Failed to create conv_bias buffer");
     
-    // Debug: Verify buffer was created correctly by reading back immediately
-    if (weight_init_debug == 1) {
-        cl_command_queue queue = ctx_->getQueue();
-        std::vector<float> verify_weight(conv_weight.size());
-        std::vector<float> verify_bias(conv_bias.size());
-        clEnqueueReadBuffer(queue, conv_weight_, CL_TRUE, 0, 
-                           conv_weight.size() * sizeof(float), verify_weight.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(queue, conv_bias_, CL_TRUE, 0, 
-                           conv_bias.size() * sizeof(float), verify_bias.data(), 0, nullptr, nullptr);
-        std::cout << "[Weight Init Debug] conv_weight after buffer creation: first=" << verify_weight[0] 
-                  << ", second=" << verify_weight[1] << ", matches=" 
-                  << (std::abs(verify_weight[0] - conv_weight[0]) < 1e-5f) << std::endl;
-        std::cout << "[Weight Init Debug] conv_bias after buffer creation: first=" << verify_bias[0] 
-                  << ", second=" << verify_bias[1] << ", matches=" 
-                  << (std::abs(verify_bias[0] - conv_bias[0]) < 1e-5f) << std::endl;
-    }
     
     A_ = clCreateBuffer(
         context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
@@ -1097,24 +992,6 @@ cl_mem SSDLayer::forward(
     clFinish(queue);
     
     // Debug: Check xBC after split (before conv1d)
-    static int split_debug_count = 0;
-    split_debug_count++;
-    if (split_debug_count == 1) {
-        std::vector<float> xBC_check(xBC_size);
-        clEnqueueReadBuffer(queue, xBC_buf, CL_TRUE, 0, 
-                           xBC_size * sizeof(float), xBC_check.data(), 0, nullptr, nullptr);
-        float xBC_check_min = xBC_check[0], xBC_check_max = xBC_check[0], xBC_check_sum = 0.0f;
-        for (size_t i = 0; i < std::min(xBC_size, size_t(1000)); ++i) {
-            xBC_check_min = std::min(xBC_check_min, xBC_check[i]);
-            xBC_check_max = std::max(xBC_check_max, xBC_check[i]);
-            xBC_check_sum += xBC_check[i];
-        }
-        std::cout << "[Split Debug] xBC after split (before conv1d): min=" << xBC_check_min 
-                  << ", max=" << xBC_check_max << ", mean=" << (xBC_check_sum / std::min(xBC_size, size_t(1000))) << std::endl;
-        std::cout << "[Split Debug] First few xBC values: " << xBC_check[0] << " " << xBC_check[1] 
-                  << " " << xBC_check[2] << " " << xBC_check[3] << " " << xBC_check[4] << std::endl;
-    }
-    
     // Step 3: conv1d on xBC with Swish activation using GPU kernel
     // xBC is [batch, seq_len, xBC_channels] where xBC_channels = 2*d_inner + 2*d_state*n_groups
     // BUT: MLX conv1d processes only the first conv_dim channels (d_inner + 2*d_state*n_groups)
@@ -1308,8 +1185,6 @@ cl_mem SSDLayer::forward(
     clReleaseMemObject(conv_output_buf);
     clFinish(queue);
     
-    std::cout << "[SSDLayer] Conv1d forward completed on GPU (with state concatenation and element dropping)" << std::endl;
-    
     // Step 4: Split xBC into x, B, C
     // Read xBC_conv from GPU
     std::vector<float> xBC_conv_read(xBC_size);
@@ -1404,12 +1279,9 @@ cl_mem SSDLayer::forward(
             // Note: SSM forward kernels may be nullptr if they were skipped (e.g., PowerVR driver bug)
             // This is OK - forward() will check and use CPU fallback
         } catch (const std::exception& e) {
-            std::cerr << "[SSDLayer] Error building kernels in forward(): " << e.what() << std::endl;
-            std::cerr << "[SSDLayer] This may be a PowerVR driver issue. Will use CPU fallback for SSM forward." << std::endl;
             // Don't throw - allow CPU fallback to be used
             // SSM forward kernels will be nullptr, which is fine
         } catch (...) {
-            std::cerr << "[SSDLayer] Unknown error building kernels (possible driver crash)" << std::endl;
             throw std::runtime_error("OpenCL driver crashed while building kernels");
         }
     }
@@ -1420,7 +1292,6 @@ cl_mem SSDLayer::forward(
     ssm_call_count++;
     if (!process_dt_kernel_) {
         // CPU fallback for SSM forward computation (matrix-based, matching MLX)
-        std::cout << "[SSDLayer] Call #" << ssm_call_count << " - Using CPU fallback for SSM forward (GPU kernels not available)" << std::endl;
         
         // Read necessary data from GPU
         std::vector<float> dt_cpu(dt_size);
@@ -1446,13 +1317,6 @@ cl_mem SSDLayer::forward(
         for (int h = 0; h < n_heads_; ++h) {
             A_actual[h] = A_log_cpu[h];  // Use A directly - it's already the final negative value
         }
-        
-        // Debug: Print A values for first call only
-        std::cout << "[SSDLayer] Debug - Call #" << ssm_call_count << " - A values (first 5 heads): ";
-        for (int h = 0; h < std::min(5, n_heads_); ++h) {
-            std::cout << "A[" << h << "]=" << A_actual[h] << " ";
-        }
-        std::cout << std::endl;
         
         // Process dt: add bias, softplus, clamp
         std::vector<float> dt_processed(dt_size);
@@ -1480,29 +1344,6 @@ cl_mem SSDLayer::forward(
                     dtA[idx] = dt_processed[idx] * A_actual[h];
                 }
             }
-        }
-        
-        // Debug: Print dtA sample for first call
-        static int debug_call_count = 0;
-        debug_call_count++;
-        if (debug_call_count == 1) {
-            std::cout << "[SSDLayer] Debug - dtA sample (first token, first 3 heads): ";
-            for (int h = 0; h < std::min(3, n_heads_); ++h) {
-                int idx = (0 * seq_len + 0) * n_heads_ + h;
-                std::cout << "dtA[0,0," << h << "]=" << dtA[idx] << " ";
-            }
-            std::cout << std::endl;
-            std::cout << "[SSDLayer] Debug - dt_processed sample (first token, first 3 heads): ";
-            for (int h = 0; h < std::min(3, n_heads_); ++h) {
-                int idx = (0 * seq_len + 0) * n_heads_ + h;
-                std::cout << "dt[0,0," << h << "]=" << dt_processed[idx] << " ";
-            }
-            std::cout << std::endl;
-            std::cout << "[SSDLayer] Debug - A_actual sample (first 3 heads): ";
-            for (int h = 0; h < std::min(3, n_heads_); ++h) {
-                std::cout << "A[" << h << "]=" << A_actual[h] << " ";
-            }
-            std::cout << std::endl;
         }
         
         // Compute segsum decay matrix: decay[s,t] = exp(sum from k=t+1 to s of dtA[k])
@@ -1581,10 +1422,6 @@ cl_mem SSDLayer::forward(
         
         // Compute final output: y = tril(CB * decay) @ dtx + D * x
         std::vector<float> y_cpu(x_size);
-        std::cout << "[SSDLayer] Call #" << ssm_call_count << " - Computing output: batch_size=" << batch_size 
-                  << ", seq_len=" << seq_len << ", n_heads_=" << n_heads_ << ", d_head_=" << d_head_ 
-                  << ", d_inner_=" << d_inner_ << ", x_size=" << x_size << std::endl;
-        int computed_count = 0;
         for (int b = 0; b < batch_size; ++b) {
             for (int s = 0; s < seq_len; ++s) {
                 for (int h = 0; h < n_heads_; ++h) {
@@ -1592,7 +1429,6 @@ cl_mem SSDLayer::forward(
                     for (int d = 0; d < d_head_; ++d) {
                         int x_idx = (b * seq_len + s) * d_inner_ + h * d_head_ + d;
                         if (x_idx >= x_size) {
-                            std::cerr << "[SSDLayer] ERROR: x_idx=" << x_idx << " >= x_size=" << x_size << std::endl;
                             continue;
                         }
                         float output_sum = 0.0f;
@@ -1601,14 +1437,12 @@ cl_mem SSDLayer::forward(
                         for (int t = 0; t <= s; ++t) {
                             int x_t_idx = (b * seq_len + t) * d_inner_ + h * d_head_ + d;
                             if (x_t_idx >= dtx.size()) {
-                                std::cerr << "[SSDLayer] ERROR: x_t_idx=" << x_t_idx << " >= dtx.size()=" << dtx.size() << std::endl;
                                 continue;
                             }
                             float dtx_t = dtx[x_t_idx];
                             
                             int decay_idx = (b * n_heads_ + h) * seq_len * seq_len + s * seq_len + t;
                             if (decay_idx >= decay.size()) {
-                                std::cerr << "[SSDLayer] ERROR: decay_idx=" << decay_idx << " >= decay.size()=" << decay.size() << std::endl;
                                 continue;
                             }
                             float decay_st = decay[decay_idx];
@@ -1616,7 +1450,6 @@ cl_mem SSDLayer::forward(
                             // CB is stored as CB[b, g, s, t] = CB[((b * n_groups_ + g) * seq_len + s) * seq_len + t]
                             int CB_idx = ((b * n_groups_ + group_idx) * seq_len + s) * seq_len + t;
                             if (CB_idx >= CB.size()) {
-                                std::cerr << "[SSDLayer] ERROR: CB_idx=" << CB_idx << " >= CB.size()=" << CB.size() << std::endl;
                                 continue;
                             }
                             float CB_st = CB[CB_idx];
@@ -1627,84 +1460,14 @@ cl_mem SSDLayer::forward(
                         // Add D * x
                         output_sum += D_cpu[h] * x_cpu[x_idx];
                         y_cpu[x_idx] = output_sum;
-                        computed_count++;
                     }
                 }
             }
-        }
-        std::cout << "[SSDLayer] Call #" << ssm_call_count << " - Computed " << computed_count << " output values" << std::endl;
-        
-        // Debug: Sample a few values to see what's happening (force print)
-        std::cout << "[SSDLayer] Call #" << ssm_call_count << " - Sample values:" << std::endl;
-        std::cout << "  conv_dim_=" << conv_dim_ << ", d_inner_=" << d_inner_ << ", d_state_=" << d_state_ << ", n_groups_=" << n_groups_ << std::endl;
-        // Read xBC_conv_read from GPU to check if B and C sections are zeros
-        std::vector<float> xBC_conv_check(xBC_size);
-        clEnqueueReadBuffer(queue, xBC_buf, CL_TRUE, 0, xBC_size * sizeof(float), xBC_conv_check.data(), 0, nullptr, nullptr);
-        std::cout << "  xBC_conv_read[0]=" << xBC_conv_check[0] << ", xBC_conv_read[d_inner_]=" 
-                  << (xBC_conv_check.size() > d_inner_ ? xBC_conv_check[d_inner_] : 0.0f) 
-                  << ", xBC_conv_read[d_inner_+d_state*n_groups]=" 
-                  << (xBC_conv_check.size() > (d_inner_ + d_state_ * n_groups_) ? xBC_conv_check[d_inner_ + d_state_ * n_groups_] : 0.0f) << std::endl;
-        if (x_cpu.size() > 0) std::cout << "  x_cpu[0]=" << x_cpu[0] << ", x_cpu[100]=" << (x_cpu.size() > 100 ? x_cpu[100] : 0.0f) << std::endl;
-        if (B_cpu.size() > 0) std::cout << "  B_cpu[0]=" << B_cpu[0] << ", B_cpu[10]=" << (B_cpu.size() > 10 ? B_cpu[10] : 0.0f) << std::endl;
-        if (C_cpu.size() > 0) std::cout << "  C_cpu[0]=" << C_cpu[0] << ", C_cpu[10]=" << (C_cpu.size() > 10 ? C_cpu[10] : 0.0f) << std::endl;
-        if (dt_processed.size() > 0) std::cout << "  dt_processed[0]=" << dt_processed[0] << ", dt_processed[10]=" << (dt_processed.size() > 10 ? dt_processed[10] : 0.0f) << std::endl;
-        if (CB.size() > 0) std::cout << "  CB[0]=" << CB[0] << ", CB[10]=" << (CB.size() > 10 ? CB[10] : 0.0f) << std::endl;
-        if (decay.size() > 0) std::cout << "  decay[0]=" << decay[0] << ", decay[10]=" << (decay.size() > 10 ? decay[10] : 0.0f) << std::endl;
-        if (dtx.size() > 0) std::cout << "  dtx[0]=" << dtx[0] << ", dtx[100]=" << (dtx.size() > 100 ? dtx[100] : 0.0f) << std::endl;
-        if (D_cpu.size() > 0) std::cout << "  D_cpu[0]=" << D_cpu[0] << ", D_cpu[1]=" << (D_cpu.size() > 1 ? D_cpu[1] : 0.0f) << std::endl;
-        if (y_cpu.size() > 0) std::cout << "  y_cpu[0]=" << y_cpu[0] << ", y_cpu[100]=" << (y_cpu.size() > 100 ? y_cpu[100] : 0.0f) << std::endl;
-        
-        // Debug: Check intermediate values before computing output
-        std::cout << "[SSDLayer] Call #" << ssm_call_count << " - Vector sizes: x=" << x_cpu.size() 
-                  << ", CB=" << CB.size() << ", decay=" << decay.size() << ", dtx=" << dtx.size() << std::endl;
-        if (x_cpu.size() > 0 && CB.size() > 0 && decay.size() > 0 && dtx.size() > 0) {
-            float x_min = x_cpu[0], x_max = x_cpu[0], x_sum = 0.0f;
-            float CB_min = CB[0], CB_max = CB[0], CB_sum = 0.0f;
-            float decay_min = decay[0], decay_max = decay[0], decay_sum = 0.0f;
-            float dtx_min = dtx[0], dtx_max = dtx[0], dtx_sum = 0.0f;
-            for (float val : x_cpu) {
-                x_min = std::min(x_min, val);
-                x_max = std::max(x_max, val);
-                x_sum += val;
-            }
-            for (float val : CB) {
-                CB_min = std::min(CB_min, val);
-                CB_max = std::max(CB_max, val);
-                CB_sum += val;
-            }
-            for (float val : decay) {
-                decay_min = std::min(decay_min, val);
-                decay_max = std::max(decay_max, val);
-                decay_sum += val;
-            }
-            for (float val : dtx) {
-                dtx_min = std::min(dtx_min, val);
-                dtx_max = std::max(dtx_max, val);
-                dtx_sum += val;
-            }
-            std::cout << "[SSDLayer] Call #" << ssm_call_count << " - Intermediate stats:" << std::endl;
-            std::cout << "  x: min=" << x_min << ", max=" << x_max << ", mean=" << (x_sum / x_cpu.size()) << std::endl;
-            std::cout << "  CB: min=" << CB_min << ", max=" << CB_max << ", mean=" << (CB_sum / CB.size()) << std::endl;
-            std::cout << "  decay: min=" << decay_min << ", max=" << decay_max << ", mean=" << (decay_sum / decay.size()) << std::endl;
-            std::cout << "  dtx: min=" << dtx_min << ", max=" << dtx_max << ", mean=" << (dtx_sum / dtx.size()) << std::endl;
-        } else {
-            std::cout << "[SSDLayer] ERROR: Empty vectors detected!" << std::endl;
         }
         
         // Write result back to GPU
         clEnqueueWriteBuffer(queue, x_buf, CL_TRUE, 0, x_size * sizeof(float), y_cpu.data(), 0, nullptr, nullptr);
         clFinish(queue);
-        
-        // Debug: Check SSM output stats
-        float y_min = y_cpu[0], y_max = y_cpu[0], y_sum = 0.0f;
-        for (float val : y_cpu) {
-            y_min = std::min(y_min, val);
-            y_max = std::max(y_max, val);
-            y_sum += val;
-        }
-        float y_mean = y_sum / y_cpu.size();
-        std::cout << "[SSDLayer] Call #" << ssm_call_count << " - SSM output stats: min=" << y_min 
-                  << ", max=" << y_max << ", mean=" << y_mean << std::endl;
         
         // CPU fallback complete - continue with gate and norm
         // (skip GPU kernel cleanup since we didn't allocate those buffers)
@@ -2070,8 +1833,6 @@ cl_mem SSDLayer::step(
     if (err != CL_SUCCESS) {
         // PowerVR driver sometimes reports errors but execution succeeds - log but don't throw
         // The "NDRANGE_KERNEL executed abnormally" message is a driver diagnostic, not a fatal error
-        std::cerr << "[SSDLayer] Warning: clFinish returned error " << err 
-                  << " after conv_update (PowerVR driver quirk - execution may have succeeded)" << std::endl;
     }
     
     // Update state->state1 with next_conv_state

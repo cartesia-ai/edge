@@ -100,12 +100,9 @@ void EmbeddingLayer::initializeWeights(const std::vector<float>& weights) {
         }
         
         weights_buffers_.push_back(chunk_buffer);
-        std::cout << "  [Embedding] Chunk " << chunk_idx << ": tokens [" << start_token 
-                  << ", " << end_token << "), size=" << (chunk_buffer_size / 1024 / 1024) << " MB" << std::endl;
     }
     
     weights_initialized_ = true;
-    std::cout << "  [Embedding] ✓ Created " << num_chunks_ << " weight chunks" << std::endl;
 }
 
 cl_mem EmbeddingLayer::encode(cl_mem token_ids, int batch_size, int seq_len, cl_command_queue queue) {

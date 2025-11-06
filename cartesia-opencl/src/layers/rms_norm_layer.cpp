@@ -25,7 +25,6 @@ RMSNormLayer::RMSNormLayer(OpenCLContextManager* ctx, int d_model)
     
     // Debug output
     // size_t buffer_size_kb = (d_model * sizeof(float)) / 1024;
-    // std::cout << "  [RMSNorm] d_model=" << d_model 
     //           << ", params=" << d_model
     //           << ", buffer_size=" << buffer_size_kb << " KB" << std::endl;
     
@@ -177,9 +176,6 @@ __kernel void zero_buffer(__global float* buffer, const int size) {
                                 if (std::isnan(zero_check[i])) nan_count++;
                             }
                         }
-                        std::cout << "  [RMSNorm Zero Check] After zero kernel: " << non_zero_count 
-                                  << " non-zero values, " << nan_count << " NaNs out of " 
-                                  << total_elements << " values" << std::endl;
                     }
                 }
             }
@@ -230,10 +226,6 @@ __kernel void zero_buffer(__global float* buffer, const int size) {
             rounded_global = ((global_size + local_size - 1) / local_size) * local_size;
         }
         if (wg_err == CL_SUCCESS) {
-            std::cout << "  [RMSNorm Layer 6 Kernel Debug] Max work-group size: " << max_work_group_size 
-                      << ", Using local size: " << local_size 
-                      << ", Global size: " << global_size 
-                      << " (rounded to: " << rounded_global << ")" << std::endl;
         }
     }
     
@@ -278,19 +270,11 @@ __kernel void zero_buffer(__global float* buffer, const int size) {
                     }
                 }
             }
-            std::cout << "  [RMSNorm Layer 6 Input Debug] Input has " << input_nan_count 
-                      << " NaN/Inf out of " << total_elements << " values" << std::endl;
-            std::cout << "  [RMSNorm Layer 6 Input Debug] Input NaN/Inf per token: ";
             for (int i = 0; i < seq_len; ++i) {
-                std::cout << "token" << i << "=" << input_nan_per_token[i] << "/" << d_model_ << " ";
             }
-            std::cout << std::endl;
-            std::cout << "  [RMSNorm Layer 6 Input Debug] Token sum_sq (mean_sq proxy): ";
             for (int i = 0; i < seq_len; ++i) {
                 float mean_sq_proxy = token_sum_sq[i] / d_model_;
-                std::cout << "token" << i << "=" << mean_sq_proxy << " ";
             }
-            std::cout << std::endl;
         }
         
         // Check weights for NaN
@@ -305,8 +289,6 @@ __kernel void zero_buffer(__global float* buffer, const int size) {
                     weights_nan_count++;
                 }
             }
-            std::cout << "  [RMSNorm Layer 6 Weights Debug] Weights have " << weights_nan_count 
-                      << " NaN/Inf out of " << d_model_ << " values" << std::endl;
         }
         
         // Then check the OUTPUT buffer
@@ -325,25 +307,14 @@ __kernel void zero_buffer(__global float* buffer, const int size) {
                     }
                 }
             }
-            std::cout << "  [RMSNorm Layer 6 Debug] Output: " << nan_count 
-                      << " NaNs out of " << total_elements << " values" << std::endl;
-            std::cout << "  [RMSNorm Layer 6 Debug] NaNs per token: ";
             for (int i = 0; i < seq_len; ++i) {
-                std::cout << "token" << i << "=" << nan_per_token[i] << "/" << d_model_ << " ";
             }
-            std::cout << std::endl;
             
             // Check token 5 specifically
-            std::cout << "  [RMSNorm Layer 6 Debug] Token 5 first 5 values: ";
             for (int i = 5 * d_model_; i < 5 * d_model_ + 5; ++i) {
-                std::cout << rms_output[i] << " ";
             }
-            std::cout << std::endl;
-            std::cout << "  [RMSNorm Layer 6 Debug] Token 0 first 5 values: ";
             for (int i = 0; i < 5; ++i) {
-                std::cout << rms_output[i] << " ";
             }
-            std::cout << std::endl;
         }
     }
     

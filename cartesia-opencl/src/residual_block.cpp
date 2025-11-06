@@ -88,13 +88,6 @@ cl_mem ResidualBlock::forward(
                             inf_count++;
                         }
                     }
-                    std::cout << "  [ResidualBlock PreNorm Debug] After pre-norm: " << nan_count 
-                              << " NaNs, " << inf_count << " Infs out of " << input_size << " values, buffer_size=" << buf_size << std::endl;
-                    std::cout << "  [ResidualBlock PreNorm Debug] NaNs per token: ";
-                    for (int i = 0; i < seq_len; ++i) {
-                        std::cout << "token" << i << "=" << nan_per_token[i] << "/" << d_model_ << " ";
-                    }
-                    std::cout << std::endl;
                 }
             }
             checked_layer6_prenorm = true;
@@ -121,29 +114,21 @@ cl_mem ResidualBlock::forward(
             for (float val : before_forward_check) {
                 if (std::isnan(val)) { nan_count++; }
             }
-            std::cout << "  [ResidualBlock BeforeForward] Input right before layer->forward(): " 
-                      << nan_count << " NaNs out of " << input_size << " values" << std::endl;
             
             // Save buffer data and pointer for comparison
             saved_buffer_data = before_forward_check;
             saved_buffer_ptr = input;
             
             // Print token 5 values to compare later
-            std::cout << "  [ResidualBlock BeforeForward] Saved token 5 first 5 values: ";
             for (int i = 5 * d_model_; i < 5 * d_model_ + 5; ++i) {
-                std::cout << before_forward_check[i] << " ";
             }
-            std::cout << std::endl;
         }
         checked_before_forward = true;
     }
     
     // If we saved buffer data, check if the pointer is still the same when we call forward
     if (checked_before_forward && layer_ && layer_->isStateful() && input == saved_buffer_ptr) {
-        std::cout << "  [ResidualBlock] About to call layer->forward() with SAME buffer pointer" << std::endl;
     } else if (checked_before_forward && layer_ && layer_->isStateful() && input != saved_buffer_ptr) {
-        std::cout << "  [ResidualBlock] WARNING: Buffer pointer changed! Was=" << saved_buffer_ptr 
-                  << ", Now=" << input << std::endl;
     }
     
     cl_mem output;

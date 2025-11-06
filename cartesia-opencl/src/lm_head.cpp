@@ -40,12 +40,6 @@ LMHead::LMHead(OpenCLContextManager* ctx, int d_model, int vocab_size)
     size_t total_size_mb = (total_params * sizeof(float)) / (1024 * 1024);
     size_t chunk_size_mb = (chunk_size_ * d_model * sizeof(float)) / (1024 * 1024);
     
-    std::cout << "  [LMHead] d_model=" << d_model 
-              << ", vocab_size=" << vocab_size 
-              << ", params=" << total_params << std::endl;
-    std::cout << "  [LMHead] Chunking: " << num_chunks_ << " chunks × " 
-              << chunk_size_ << " tokens = " << chunk_size_mb << " MB/chunk, "
-              << total_size_mb << " MB total" << std::endl;
 }
 
 LMHead::~LMHead() {
@@ -149,23 +143,6 @@ cl_mem LMHead::forward(cl_mem hidden_states, int batch_size, cl_command_queue qu
         throw std::runtime_error("Failed to read hidden states");
     }
     
-    // Debug: Check hidden state statistics (first time only)
-    static bool debug_hidden_lm = true;
-    if (debug_hidden_lm) {
-        float min_h = *std::min_element(hidden_cpu.begin(), hidden_cpu.end());
-        float max_h = *std::max_element(hidden_cpu.begin(), hidden_cpu.end());
-        float sum_h = std::accumulate(hidden_cpu.begin(), hidden_cpu.end(), 0.0f);
-        float mean_h = sum_h / hidden_cpu.size();
-        std::cout << "  [LMHead Debug] Hidden state input: min=" << min_h 
-                  << ", max=" << max_h << ", mean=" << mean_h << std::endl;
-        std::cout << "  [LMHead Debug] First 10 hidden values: ";
-        for (int i = 0; i < 10 && i < d_model_; ++i) {
-            std::cout << hidden_cpu[i] << " ";
-        }
-        std::cout << std::endl;
-        debug_hidden_lm = false;
-    }
-    
     // Read weights from chunks
     std::vector<std::vector<float>> chunks_cpu(num_chunks_);
     for (int chunk_idx = 0; chunk_idx < num_chunks_; ++chunk_idx) {
@@ -188,30 +165,6 @@ cl_mem LMHead::forward(cl_mem hidden_states, int batch_size, cl_command_queue qu
     // Formula: logits[v] = sum_d (hidden[d] * weights[v, d])
     // where weights are stored row-major: weights[v, d] = weights[v * d_model + d]
     std::vector<float> logits_cpu(batch_size * vocab_size_);
-    
-    // Debug: Check weight statistics (first time only)
-    static bool debug_weights_lm = true;
-    if (debug_weights_lm && !chunks_cpu.empty()) {
-        float min_w = chunks_cpu[0][0], max_w = chunks_cpu[0][0], sum_w = 0.0f;
-        int count = 0;
-        for (const auto& chunk : chunks_cpu) {
-            for (float w : chunk) {
-                min_w = std::min(min_w, w);
-                max_w = std::max(max_w, w);
-                sum_w += w;
-                count++;
-            }
-        }
-        float mean_w = sum_w / count;
-        std::cout << "  [LMHead Debug] Weight stats: min=" << min_w 
-                  << ", max=" << max_w << ", mean=" << mean_w << std::endl;
-        std::cout << "  [LMHead Debug] First 10 weight values: ";
-        for (int i = 0; i < 10 && i < static_cast<int>(chunks_cpu[0].size()); ++i) {
-            std::cout << chunks_cpu[0][i] << " ";
-        }
-        std::cout << std::endl;
-        debug_weights_lm = false;
-    }
     
     for (int b = 0; b < batch_size; ++b) {
         for (int v = 0; v < vocab_size_; ++v) {

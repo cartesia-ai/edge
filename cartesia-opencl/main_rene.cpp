@@ -19,6 +19,7 @@
 #include "src/sampling.h"
 #include "src/weights.h"
 #include "src/tokenizer.h"
+#include "src/debug.h"
 #include <cstdlib>
 #include <ctime>
 #include <cmath>
@@ -27,31 +28,6 @@
 
 using namespace cartesia_opencl;
 
-// Helper: Print device memory info
-void printMemoryInfo(cl_device_id device, const std::string& label) {
-    cl_ulong free_mem = 0;
-    cl_ulong total_mem = 0;
-    cl_int err;
-    
-    // Try to get global memory size (total available)
-    err = clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(cl_ulong), &total_mem, nullptr);
-    if (err == CL_SUCCESS) {
-        std::cout << "  [Memory " << label << "] Total device memory: " 
-                  << (total_mem / 1024 / 1024) << " MB" << std::endl;
-    }
-    
-    // Try to get max allocation size
-    size_t max_alloc = 0;
-    err = clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(size_t), &max_alloc, nullptr);
-    if (err == CL_SUCCESS) {
-        std::cout << "  [Memory " << label << "] Max allocation: " 
-                  << (max_alloc / 1024 / 1024) << " MB" << std::endl;
-    }
-    
-    // Note: OpenCL doesn't have a standard way to query free memory
-    // Some vendors provide extensions, but they're not universal
-    std::cout.flush();
-}
 
 // Helper: Read token IDs from binary file
 std::vector<int32_t> readTokenFile(const std::string& filename) {
@@ -77,33 +53,6 @@ std::vector<int32_t> readTokenFile(const std::string& filename) {
     return tokens;
 }
 
-// Helper: Check for NaN in buffer (debug)
-bool checkForNaN(cl_mem buffer, size_t size, cl_command_queue queue, const std::string& name) {
-    std::vector<float> data(size);
-    cl_int err = clEnqueueReadBuffer(queue, buffer, CL_TRUE, 0, size * sizeof(float), data.data(), 0, nullptr, nullptr);
-    if (err != CL_SUCCESS) {
-        std::cerr << "  [NaN Check] Failed to read " << name << std::endl;
-        return false;
-    }
-    
-    int nan_count = 0, inf_count = 0;
-    float min_val = data[0], max_val = data[0];
-    for (float val : data) {
-        if (std::isnan(val)) nan_count++;
-        if (std::isinf(val)) inf_count++;
-        if (std::isfinite(val)) {
-            min_val = std::min(min_val, val);
-            max_val = std::max(max_val, val);
-        }
-    }
-    
-    if (nan_count > 0 || inf_count > 0) {
-        std::cout << "  [NaN Check] " << name << ": " << nan_count << " NaNs, " << inf_count << " Infs, "
-                  << "min=" << min_val << ", max=" << max_val << std::endl;
-        return true;
-    }
-    return false;
-}
 
 // Helper: Load weights from binary file
 std::vector<float> loadWeights(const std::string& filename) {
@@ -126,28 +75,6 @@ std::vector<float> loadWeights(const std::string& filename) {
         throw std::runtime_error("Failed to read weight file completely: " + filename);
     }
     
-    // Debug: Check if weights are all zeros (only for conv_weight and conv_bias)
-    static int conv_file_debug = 0;
-    if (filename.find("conv_weight.bin") != std::string::npos || filename.find("conv_bias.bin") != std::string::npos) {
-        conv_file_debug++;
-        if (conv_file_debug <= 2) {  // First conv_weight and first conv_bias
-            float w_min = weights[0], w_max = weights[0], w_sum = 0.0f;
-            int non_zero_count = 0;
-            for (size_t i = 0; i < std::min(weights.size(), size_t(1000)); ++i) {
-                w_min = std::min(w_min, weights[i]);
-                w_max = std::max(w_max, weights[i]);
-                w_sum += weights[i];
-                if (std::abs(weights[i]) > 1e-6f) non_zero_count++;
-            }
-            std::cout << "  [LoadWeights Debug] " << filename << ": size=" << num_weights 
-                      << ", min=" << w_min << ", max=" << w_max 
-                      << ", mean=" << (w_sum / std::min(weights.size(), size_t(1000)))
-                      << ", non_zero_count=" << non_zero_count << "/" << std::min(weights.size(), size_t(1000))
-                      << ", first=" << weights[0] << ", second=" << weights[1] << std::endl;
-        }
-    }
-    
-    std::cout << "  Loaded " << num_weights << " weights from " << filename << std::endl;
     return weights;
 }
 
@@ -302,12 +229,14 @@ int main(int argc, char* argv[]) {
             test_file.close();
             std::cout << "Reading token file: " << input_arg << std::endl;
             prompt_tokens = readTokenFile(input_arg);
-            std::cout << "Loaded " << prompt_tokens.size() << " prompt tokens: [";
-            for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-                std::cout << prompt_tokens[i];
-                if (i < prompt_tokens.size() - 1) std::cout << ", ";
-            }
-            std::cout << "]" << std::endl;
+            DEBUG_TOKENS({
+                std::cout << "Loaded " << prompt_tokens.size() << " prompt tokens: [";
+                for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+                    std::cout << prompt_tokens[i];
+                    if (i < prompt_tokens.size() - 1) std::cout << ", ";
+                }
+                std::cout << "]" << std::endl;
+            });
         } else {
             // Treat as text input - tokenize it
             is_text_input = true;
@@ -373,12 +302,14 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             
-            std::cout << "Tokenized to " << prompt_tokens.size() << " tokens: [";
-            for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-                std::cout << prompt_tokens[i];
-                if (i < prompt_tokens.size() - 1) std::cout << ", ";
-            }
-            std::cout << "]" << std::endl;
+            DEBUG_TOKENS({
+                std::cout << "Tokenized to " << prompt_tokens.size() << " tokens: [";
+                for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+                    std::cout << prompt_tokens[i];
+                    if (i < prompt_tokens.size() - 1) std::cout << ", ";
+                }
+                std::cout << "]" << std::endl;
+            });
         }
         
         // Initialize OpenCL first (needed for vocab size check)
@@ -438,18 +369,6 @@ int main(int argc, char* argv[]) {
         // Pattern: 12 unique layers repeated n_layer_repeats times
         std::cout << "Building model with " << (12 * n_layer_repeats) << " layers..." << std::endl;
         
-        // Print device memory info for diagnostics
-        {
-            cl_device_id device = ctx_mgr.getDevice();
-            size_t max_alloc_size = 0;
-            cl_ulong global_mem_size = 0;
-            cl_int err = clGetDeviceInfo(device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(size_t), &max_alloc_size, nullptr);
-            clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(cl_ulong), &global_mem_size, nullptr);
-            if (err == CL_SUCCESS) {
-                std::cout << "Device memory: max_alloc=" << (max_alloc_size / 1024 / 1024) << " MB, "
-                          << "global=" << (global_mem_size / 1024 / 1024) << " MB" << std::endl;
-            }
-        }
         
         // Helper function to create SSD layer with weights (loaded or generated)
         auto createSSDLayer = [&](int layer_idx, int expand, int kernel_size, int d_state, int d_head, int n_groups) -> SSDLayer* {
@@ -488,8 +407,6 @@ int main(int argc, char* argv[]) {
                     d_state = calculated_d_state;
                     d_head = calculated_d_head;
                     n_heads = calculated_n_heads;
-                    std::cout << "  [Layer " << layer_idx << "] Calculated: d_state=" << d_state 
-                              << ", d_head=" << d_head << ", n_heads=" << n_heads << std::endl;
                 } else {
                     // Fall back to defaults
                     d_inner = ACTUAL_D_MODEL * expand;
@@ -516,35 +433,9 @@ int main(int argc, char* argv[]) {
                 validateWeightSize(conv_weight, conv_dim * kernel_size, 
                                  "SSD conv_weight", "layer " + std::to_string(layer_idx));
                 
-                // Debug: Check weights right after loading (only first layer)
-                if (layer_idx == 0) {
-                    float w_min = conv_weight[0], w_max = conv_weight[0], w_sum = 0.0f;
-                    for (size_t i = 0; i < std::min(conv_weight.size(), size_t(100)); ++i) {
-                        w_min = std::min(w_min, conv_weight[i]);
-                        w_max = std::max(w_max, conv_weight[i]);
-                        w_sum += conv_weight[i];
-                    }
-                    std::cout << "  [Main Debug] conv_weight after load: min=" << w_min << ", max=" << w_max 
-                              << ", mean=" << (w_sum / std::min(conv_weight.size(), size_t(100))) 
-                              << ", first=" << conv_weight[0] << ", second=" << conv_weight[1] << std::endl;
-                }
-                
                 conv_bias = loadWeights(layer_dir_str + "/conv_bias.bin");
                 validateWeightSize(conv_bias, conv_dim, 
                                  "SSD conv_bias", "layer " + std::to_string(layer_idx));
-                
-                // Debug: Check bias right after loading (only first layer)
-                if (layer_idx == 0) {
-                    float b_min = conv_bias[0], b_max = conv_bias[0], b_sum = 0.0f;
-                    for (size_t i = 0; i < std::min(conv_bias.size(), size_t(100)); ++i) {
-                        b_min = std::min(b_min, conv_bias[i]);
-                        b_max = std::max(b_max, conv_bias[i]);
-                        b_sum += conv_bias[i];
-                    }
-                    std::cout << "  [Main Debug] conv_bias after load: min=" << b_min << ", max=" << b_max 
-                              << ", mean=" << (b_sum / std::min(conv_bias.size(), size_t(100))) 
-                              << ", first=" << conv_bias[0] << ", second=" << conv_bias[1] << std::endl;
-                }
                 
                 A = loadWeights(layer_dir_str + "/A_log.bin");
                 validateWeightSize(A, n_heads, 
@@ -815,7 +706,6 @@ int main(int argc, char* argv[]) {
         
         // Create all layers (for mamba2-130m: all 24 layers are SSD)
         int layer_count = 0;
-        std::cout << "Starting layer creation (will create " << N_LAYER << " SSD layers)..." << std::endl;
         
         // For mamba2-130m: all layers are SSD (no SwiGLU or Attention)
         for (int i = 0; i < N_LAYER; ++i) {
@@ -824,14 +714,9 @@ int main(int argc, char* argv[]) {
             loadNormWeights(block, layer_count, true);
             seq_model.addLayer(std::unique_ptr<ResidualBlock>(block));
             layer_count++;
-            
-            if ((i + 1) % 4 == 0 || (i + 1) == N_LAYER) {
-                std::cout << "  Added " << (i + 1) << " layers..." << std::endl;
-                std::cout.flush();
-            }
         }
         
-        std::cout << "✓ Built full model with " << layer_count << " layers" << std::endl;
+        std::cout << "Initialized " << layer_count << "-layer model" << std::endl;
         std::cout.flush();
         
         // LM Head
@@ -878,47 +763,6 @@ int main(int argc, char* argv[]) {
         cl_mem embeddings = embedding.encode(token_buffer, batch_size, seq_len, queue);
         std::cout << " ✓" << std::endl;
         
-        // Check embedding output and dump for comparison with MLX
-        static bool checked_embedding = false;
-        if (!checked_embedding) {
-            size_t emb_size = batch_size * seq_len * ACTUAL_D_MODEL;
-            std::vector<float> emb_check(emb_size);
-            cl_int check_err = clEnqueueReadBuffer(queue, embeddings, CL_TRUE, 0,
-                emb_size * sizeof(float), emb_check.data(), 0, nullptr, nullptr);
-            if (check_err == CL_SUCCESS) {
-                int nan_count = 0;
-                float min_val = emb_check[0], max_val = emb_check[0], sum_val = 0.0f;
-                for (float val : emb_check) {
-                    if (std::isnan(val)) { nan_count++; }
-                    if (!std::isnan(val) && !std::isinf(val)) {
-                        min_val = std::min(min_val, val);
-                        max_val = std::max(max_val, val);
-                        sum_val += val;
-                    }
-                }
-                float mean_val = sum_val / emb_size;
-                std::cout << "  [Embedding Debug] Embedding output: " << nan_count 
-                          << " NaNs out of " << emb_size << " values" << std::endl;
-                std::cout << "  [Embedding Debug] Stats: min=" << min_val 
-                          << ", max=" << max_val << ", mean=" << mean_val << std::endl;
-                
-                // Dump embedding output for comparison with MLX
-                std::string emb_output_base = output_file;
-                size_t emb_bin_pos = emb_output_base.find(".bin");
-                if (emb_bin_pos != std::string::npos) {
-                    emb_output_base = emb_output_base.substr(0, emb_bin_pos);
-                }
-                std::string emb_output_file = emb_output_base + "_prefill_embedding_output_opencl.bin";
-                std::ofstream emb_out(emb_output_file, std::ios::binary);
-                if (emb_out.is_open()) {
-                    emb_out.write(reinterpret_cast<const char*>(emb_check.data()), emb_check.size() * sizeof(float));
-                    emb_out.close();
-                    std::cout << "  [Embedding Debug] Dumped embedding to " << emb_output_file 
-                              << " (shape: (" << batch_size << ", " << seq_len << ", " << ACTUAL_D_MODEL << "))" << std::endl;
-                }
-            }
-            checked_embedding = true;
-        }
         
     // Forward through sequence model
     std::cout << "  Step 2: Forward pass through " << seq_model.getNumLayers() << " layers..." << std::flush;
@@ -932,9 +776,6 @@ int main(int argc, char* argv[]) {
     cl_mem hidden = seq_model.forward(embeddings, batch_size, seq_len, &states, queue, output_base);
     std::cout << " ✓" << std::endl;
     
-    // Check hidden state for NaN before LM head (after post-norm if applied)
-    size_t hidden_size = batch_size * seq_len * ACTUAL_D_MODEL;
-    checkForNaN(hidden, hidden_size, queue, "hidden_state_prefill_after_postnorm");
     
     // Step 3: Get logits from last token and sample first generation token
     std::cout << "  Step 3: Computing logits from last token..." << std::flush;
@@ -951,32 +792,6 @@ int main(int argc, char* argv[]) {
         throw std::runtime_error("Failed to read last token hidden state");
     }
     
-    // Debug: Check last token hidden state statistics and dump for comparison
-    static bool debug_hidden = true;
-    if (debug_hidden) {
-        float min_h = *std::min_element(last_token_hidden.begin(), last_token_hidden.end());
-        float max_h = *std::max_element(last_token_hidden.begin(), last_token_hidden.end());
-        float sum_h = std::accumulate(last_token_hidden.begin(), last_token_hidden.end(), 0.0f);
-        float mean_h = sum_h / last_token_hidden.size();
-        std::cout << "\n  [Debug] Last token hidden state: min=" << min_h 
-                  << ", max=" << max_h << ", mean=" << mean_h << std::endl;
-        std::cout << "  [Debug] First 10 values: ";
-        for (int i = 0; i < 10 && i < ACTUAL_D_MODEL; ++i) {
-            std::cout << last_token_hidden[i] << " ";
-        }
-        std::cout << std::endl;
-        
-        // Dump hidden state for comparison with MLX
-        std::string hidden_file = output_base + "_prefill_last_token_hidden.bin";
-        std::ofstream hidden_out(hidden_file, std::ios::binary);
-        if (hidden_out.is_open()) {
-            hidden_out.write(reinterpret_cast<const char*>(last_token_hidden.data()), 
-                            last_token_hidden.size() * sizeof(float));
-            hidden_out.close();
-            std::cout << "  [Debug] Dumped last token hidden state to " << hidden_file << std::endl;
-        }
-        debug_hidden = false;
-    }
     
     // Create a buffer for the last token hidden state
     cl_mem last_token_hidden_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
@@ -1002,42 +817,13 @@ int main(int argc, char* argv[]) {
     // Release the temporary buffer
     clReleaseMemObject(last_token_hidden_buf);
     
-    // Dump prefill logits for comparison (match MLX naming)
-    std::string prefill_logits_file = output_base + "_prefill_logits.bin";
-    std::ofstream prefill_logits_out(prefill_logits_file, std::ios::binary);
-    if (prefill_logits_out.is_open()) {
-        prefill_logits_out.write(reinterpret_cast<const char*>(last_token_logits.data()), 
-                                 last_token_logits.size() * sizeof(float));
-        prefill_logits_out.close();
-        std::cout << "\n  [Debug] Dumped prefill logits to " << prefill_logits_file << std::endl;
-    }
-    float min_logit = *std::min_element(last_token_logits.begin(), last_token_logits.end());
-    float max_logit = *std::max_element(last_token_logits.begin(), last_token_logits.end());
-    float sum_logit = std::accumulate(last_token_logits.begin(), last_token_logits.end(), 0.0f);
-    float mean_logit = sum_logit / last_token_logits.size();
-    std::cout << "  [Debug] Prefill logits stats: min=" << min_logit << ", max=" << max_logit 
-              << ", mean=" << mean_logit << std::endl;
-    
-    // Find top 5 logits for comparison (match MLX output format)
-    std::vector<std::pair<float, int>> logits_with_indices;
-    for (size_t i = 0; i < last_token_logits.size(); ++i) {
-        logits_with_indices.push_back({last_token_logits[i], static_cast<int>(i)});
-    }
-    std::sort(logits_with_indices.begin(), logits_with_indices.end(), 
-              [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
-                  return a.first > b.first;
-              });
-    std::cout << "  [Debug] Top 5 logits: [";
-    for (int i = 0; i < 5 && i < static_cast<int>(logits_with_indices.size()); ++i) {
-        std::cout << logits_with_indices[i].second;
-        if (i < 4 && i < static_cast<int>(logits_with_indices.size()) - 1) std::cout << " ";
-    }
-    std::cout << "] -> [";
-    for (int i = 0; i < 5 && i < static_cast<int>(logits_with_indices.size()); ++i) {
-        std::cout << logits_with_indices[i].first;
-        if (i < 4 && i < static_cast<int>(logits_with_indices.size()) - 1) std::cout << " ";
-    }
-    std::cout << "]" << std::endl;
+    DEBUG_LOGITS({
+        std::cout << "  Prefill logits (first 10): ";
+        for (int i = 0; i < 10 && i < ACTUAL_VOCAB_SIZE; ++i) {
+            std::cout << last_token_logits[i] << " ";
+        }
+        std::cout << std::endl;
+    });
     
     // Sample first token from prefill logits
     std::cout << "  Step 4: Sampling first token from prefill logits..." << std::flush;
@@ -1049,139 +835,57 @@ int main(int argc, char* argv[]) {
     
     // Generate tokens
     std::cout << "Generating " << max_tokens << " tokens..." << std::endl;
-    cl_device_id device = ctx_mgr.getDevice();
-    printMemoryInfo(device, "Before Generation");
     std::vector<int32_t> generated_tokens;
         
         for (int i = 0; i < max_tokens; ++i) {
-            std::cout << "\n[Gen] Step " << (i+1) << " / " << max_tokens << std::endl;
-            printMemoryInfo(device, "Step " + std::to_string(i+1));
-            std::cout.flush();
             cl_mem current_token_buf = nullptr;
             cl_mem current_embedding = nullptr;
             cl_mem next_hidden = nullptr;
             cl_mem logits = nullptr;
             try {
-                std::cout << "  [Gen] EncodeStep: token_id=" << current_token_id << std::endl;
-                std::cout.flush();
+                DEBUG_TOKENS({
+                    std::cout << "  [Gen] Step " << (i+1) << ": token_id=" << current_token_id << std::endl;
+                });
                 // Encode current token
                 std::vector<int32_t> current_token_vec = {current_token_id};
                 current_token_buf = createTokenBuffer(context, current_token_vec);
                 current_embedding = embedding.encodeStep(current_token_buf, batch_size, queue);
                 if (!current_embedding) throw std::runtime_error("encodeStep returned null buffer");
-                std::cout << "  [Gen] EncodeStep ✓" << std::endl;
                 
-                // Check embedding for NaN (first iteration only)
-                if (i == 0) {
-                    checkForNaN(current_embedding, batch_size * ACTUAL_D_MODEL, queue, "embedding_output");
-                    
-                    // Dump embedding for token 247 for comparison with MLX
-                    std::vector<float> gen_emb_check(batch_size * ACTUAL_D_MODEL);
-                    cl_int emb_err = clEnqueueReadBuffer(queue, current_embedding, CL_TRUE, 0,
-                        gen_emb_check.size() * sizeof(float), gen_emb_check.data(), 0, nullptr, nullptr);
-                    if (emb_err == CL_SUCCESS) {
-                        float emb_min = *std::min_element(gen_emb_check.begin(), gen_emb_check.end());
-                        float emb_max = *std::max_element(gen_emb_check.begin(), gen_emb_check.end());
-                        float emb_sum = std::accumulate(gen_emb_check.begin(), gen_emb_check.end(), 0.0f);
-                        float emb_mean = emb_sum / gen_emb_check.size();
-                        std::cout << "  [Gen Debug] Token " << current_token_id << " embedding: min=" << emb_min 
-                                  << ", max=" << emb_max << ", mean=" << emb_mean << std::endl;
-                        std::cout << "  [Gen Debug] First 10: ";
-                        for (int j = 0; j < 10 && j < ACTUAL_D_MODEL; ++j) {
-                            std::cout << gen_emb_check[j] << " ";
-                        }
-                        std::cout << std::endl;
-                        
-                        // Dump to file
-                        if (!output_base.empty()) {
-                            std::string gen_emb_file = output_base + "_gen_step_0_embedding_token_" + std::to_string(current_token_id) + "_opencl.bin";
-                            std::ofstream gen_emb_out(gen_emb_file, std::ios::binary);
-                            if (gen_emb_out.is_open()) {
-                                gen_emb_out.write(reinterpret_cast<const char*>(gen_emb_check.data()), 
-                                                 gen_emb_check.size() * sizeof(float));
-                                gen_emb_out.close();
-                                std::cout << "  [Gen Debug] Dumped to " << gen_emb_file << std::endl;
-                            }
-                        }
-                    }
-                }
-                std::cout.flush();
-                
-                // Step through sequence model (pass output_base for layer dumping on first step only)
-                std::string step_output_prefix = (i == 0 && !output_base.empty()) ? output_base : "";
-                next_hidden = seq_model.step(current_embedding, batch_size, &states, queue, step_output_prefix);
+                // Step through sequence model
+                next_hidden = seq_model.step(current_embedding, batch_size, &states, queue, "");
                 if (!next_hidden) throw std::runtime_error("seq_model.step returned null buffer");
-                std::cout << "  [Gen] seq_model.step ✓" << std::endl;
-                
-                // Check hidden state for NaN (first iteration only)
-                if (i == 0) {
-                    checkForNaN(next_hidden, batch_size * ACTUAL_D_MODEL, queue, "hidden_state");
-                }
-                std::cout.flush();
                 
                 // Get logits from LM head
                 logits = lm_head.forward(next_hidden, batch_size, queue);
                 if (!logits) throw std::runtime_error("LMHead.forward returned null buffer");
-                std::cout << "  [Gen] LMHead.forward ✓" << std::endl;
-                std::cout.flush();
                 
                 // Ensure all writes are visible before CPU read in sampler
                 clFinish(queue);
-                std::cout << "  [Gen] clFinish ✓" << std::endl;
-                std::cout.flush();
                 
                 // Read logits for dumping
                 std::vector<float> gen_logits(ACTUAL_VOCAB_SIZE);
                 cl_int read_err = clEnqueueReadBuffer(queue, logits, CL_TRUE, 0,
                     ACTUAL_VOCAB_SIZE * sizeof(float), gen_logits.data(), 0, nullptr, nullptr);
                 
-                if (read_err == CL_SUCCESS) {
-                    // Dump generation step logits for comparison (match MLX naming)
-                    std::string gen_logits_file = output_base + "_gen_step_" + std::to_string(i) + "_logits.bin";
-                    std::ofstream gen_logits_out(gen_logits_file, std::ios::binary);
-                    if (gen_logits_out.is_open()) {
-                        gen_logits_out.write(reinterpret_cast<const char*>(gen_logits.data()),
-                                           gen_logits.size() * sizeof(float));
-                        gen_logits_out.close();
-                        std::cout << "\n  [Debug] Dumped gen step " << i << " logits to " << gen_logits_file << std::endl;
+                DEBUG_LOGITS({
+                    if (read_err == CL_SUCCESS) {
+                        std::cout << "  Gen step " << i << " logits (first 10): ";
+                        for (int j = 0; j < 10 && j < ACTUAL_VOCAB_SIZE; ++j) {
+                            std::cout << gen_logits[j] << " ";
+                        }
+                        std::cout << std::endl;
                     }
-                    float min_logit = *std::min_element(gen_logits.begin(), gen_logits.end());
-                    float max_logit = *std::max_element(gen_logits.begin(), gen_logits.end());
-                    float sum_logit = std::accumulate(gen_logits.begin(), gen_logits.end(), 0.0f);
-                    float mean_logit = sum_logit / gen_logits.size();
-                    std::cout << "  [Debug] Gen step " << i << " logits stats: min=" << min_logit 
-                              << ", max=" << max_logit << ", mean=" << mean_logit << std::endl;
-                    
-                    // Find top 5 logits for comparison (match MLX output format)
-                    std::vector<std::pair<float, int>> logits_with_indices;
-                    for (size_t j = 0; j < gen_logits.size(); ++j) {
-                        logits_with_indices.push_back({gen_logits[j], static_cast<int>(j)});
-                    }
-                    std::sort(logits_with_indices.begin(), logits_with_indices.end(), 
-                              [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
-                                  return a.first > b.first;
-                              });
-                    std::cout << "  [Debug] Top 5 logits: [";
-                    for (int j = 0; j < 5 && j < static_cast<int>(logits_with_indices.size()); ++j) {
-                        std::cout << logits_with_indices[j].second;
-                        if (j < 4 && j < static_cast<int>(logits_with_indices.size()) - 1) std::cout << " ";
-                    }
-                    std::cout << "] -> [";
-                    for (int j = 0; j < 5 && j < static_cast<int>(logits_with_indices.size()); ++j) {
-                        std::cout << logits_with_indices[j].first;
-                        if (j < 4 && j < static_cast<int>(logits_with_indices.size()) - 1) std::cout << " ";
-                    }
-                    std::cout << "]" << std::endl;
-                }
+                });
                 
                 // Sample next token
                 int next_token = sampler.sampleFromBuffer(
                     logits, ACTUAL_VOCAB_SIZE, queue,
                     DEFAULT_TOP_P, DEFAULT_TEMPERATURE
                 );
-                std::cout << "  [Gen] sample ✓ -> token=" << next_token << std::endl;
-                // printMemoryInfo(device, "After Step " + std::to_string(i+1));
-                std::cout.flush();
+                DEBUG_TOKENS({
+                    std::cout << "  Sampled token=" << next_token << std::endl;
+                });
                 
                 // Clamp token ID to valid range
                 if (next_token >= ACTUAL_VOCAB_SIZE) {
@@ -1224,8 +928,6 @@ int main(int argc, char* argv[]) {
         
         std::cout << std::endl;
         std::cout << "Generation loop completed!" << std::endl;
-        // printMemoryInfo(device, "After All Steps");
-        std::cout.flush();
         
         // Cleanup - protect against double-release and invalid buffers
         std::cout << "Cleaning up prefill buffers..." << std::flush;
@@ -1275,12 +977,14 @@ int main(int argc, char* argv[]) {
         
         std::cout << std::endl;
         std::cout << "Generation complete!" << std::endl;
-        std::cout << "Generated " << generated_tokens.size() << " tokens: [";
-        for (size_t i = 0; i < generated_tokens.size(); ++i) {
-            std::cout << generated_tokens[i];
-            if (i < generated_tokens.size() - 1) std::cout << ", ";
-        }
-        std::cout << "]" << std::endl;
+        DEBUG_TOKENS({
+            std::cout << "Generated " << generated_tokens.size() << " tokens: [";
+            for (size_t i = 0; i < generated_tokens.size(); ++i) {
+                std::cout << generated_tokens[i];
+                if (i < generated_tokens.size() - 1) std::cout << ", ";
+            }
+            std::cout << "]" << std::endl;
+        });
         
         // Write output (even if partially generated)
         if (!generated_tokens.empty()) {

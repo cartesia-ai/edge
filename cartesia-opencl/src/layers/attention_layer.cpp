@@ -92,30 +92,14 @@ AttentionLayer::AttentionLayer(
     size_t out_params = static_cast<size_t>(d_model_) * n_heads_ * d_head_;
     size_t total_params = qkv_params + out_params;
     size_t buffer_size_mb = (total_params * sizeof(float)) / (1024 * 1024);
-    std::cout << "  [Attention] d_model=" << d_model_
-              << ", n_heads=" << n_heads_
-              << ", kv_heads=" << kv_heads_
-              << ", d_head=" << d_head_
-              << ", d_proj=" << d_proj_
-              << ", max_context_len=" << max_context_len_
-              << ", causal=" << (causal_ ? "true" : "false")
-              << ", params=" << total_params
-              << " (qkv:" << qkv_params << ", out:" << out_params << ")"
-              << ", buffer_size=" << buffer_size_mb << " MB" << std::endl;
     
     // Create linear layers
-    std::cout << "    Creating QKV linear layer..." << std::flush;
     qkv_layer_ = std::make_unique<LinearLayer>(ctx_, d_model_, d_proj_, false);
-    std::cout << " ✓" << std::endl;
     
-    std::cout << "    Creating output linear layer..." << std::flush;
     out_layer_ = std::make_unique<LinearLayer>(ctx_, n_heads_ * d_head_, d_model_, false);
-    std::cout << " ✓" << std::endl;
     
-    std::cout << "    Building attention kernels..." << std::flush;
     // Use lazy kernel building - kernels will be built on first use
     // This allows model initialization to complete even if kernel building fails
-    std::cout << " (deferred to first use)" << std::endl;
     // buildKernels() will be called lazily in ensureKernelsBuilt()
 }
 
@@ -153,7 +137,6 @@ void AttentionLayer::buildKernels() {
         // Check environment variable to skip kernel building and use CPU fallback
         const char* skip_kernels = std::getenv("SKIP_ATTENTION_KERNELS");
         if (skip_kernels && std::string(skip_kernels) == "1") {
-            std::cout << "\n      [SKIP] Kernel building disabled via SKIP_ATTENTION_KERNELS=1" << std::flush;
             throw std::runtime_error("Kernel building skipped by user");
         }
         
@@ -192,12 +175,10 @@ __kernel void split_qkv(
     for (int i = 0; i < kv_dim; ++i) values[v_base + i] = qkv[qkv_base + q_dim + kv_dim + i];
 }
 )";
-            std::cout << "\n      Building split_qkv program..." << std::flush;
             std::vector<std::string> sources = {std::string(split_qkv_source)};
             std::string cache_key = ctx_mgr.generateCacheKey(sources) + "_split_qkv";
             split_qkv_program_ = ctx_mgr.buildProgram(sources, cache_key);
             split_qkv_kernel_ = ctx_mgr.getKernel(split_qkv_program_, "split_qkv");
-            std::cout << " ✓" << std::flush;
         }
         
         // 2. Build reshape kernels (allow CPU fallback if driver crashes)
@@ -257,16 +238,13 @@ __kernel void reshape_from_attention(
     }
 }
 )";
-            std::cout << "\n      Building reshape program..." << std::flush;
             std::vector<std::string> sources = {std::string(reshape_source)};
             std::string cache_key = ctx_mgr.generateCacheKey(sources) + "_reshape";
             reshape_program_ = ctx_mgr.buildProgram(sources, cache_key);
             reshape_q_kernel_ = ctx_mgr.getKernel(reshape_program_, "reshape_for_attention");
             reshape_kv_kernel_ = ctx_mgr.getKernel(reshape_program_, "reshape_for_attention");
             reshape_out_kernel_ = ctx_mgr.getKernel(reshape_program_, "reshape_from_attention");
-            std::cout << " ✓" << std::flush;
         } catch (const std::exception& e) {
-            std::cerr << "\n      WARNING: Reshape program build failed, using CPU reshape fallback: " << e.what() << std::endl;
             use_cpu_reshape_ = true;
         }
         
@@ -350,12 +328,10 @@ __kernel void scaled_dot_product_attention(
     }
 }
 )";
-            std::cout << "\n      Building attention program (simplified)..." << std::flush;
             std::vector<std::string> sources = {std::string(attention_source)};
             std::string cache_key = ctx_mgr.generateCacheKey(sources) + "_attention";
             attention_program_ = ctx_mgr.buildProgram(sources, cache_key);
             attention_kernel_ = ctx_mgr.getKernel(attention_program_, "scaled_dot_product_attention");
-            std::cout << " ✓" << std::flush;
         }
         
         // 4. Build concatenate kernel
@@ -396,15 +372,12 @@ __kernel void concatenate_kv(
     }
 }
 )";
-            std::cout << "\n      Building concatenate program..." << std::flush;
             std::vector<std::string> sources = {std::string(concat_source)};
             std::string cache_key = ctx_mgr.generateCacheKey(sources) + "_concat";
             concat_program_ = ctx_mgr.buildProgram(sources, cache_key);
             concatenate_kv_kernel_ = ctx_mgr.getKernel(concat_program_, "concatenate_kv");
-            std::cout << " ✓" << std::flush;
         }
     } catch (const std::exception& e) {
-        std::cerr << "Error in AttentionLayer::buildKernels(): " << e.what() << std::endl;
         throw;
     }
 }
@@ -426,36 +399,24 @@ void AttentionLayer::ensureKernelsBuilt() {
     if (skip_kernels && std::string(skip_kernels) == "1") {
         use_cpu_fallback_ = true;
         kernel_build_failed_ = true;
-        std::cout << "\n[AttentionLayer] Skipping kernel build (SKIP_ATTENTION_KERNELS=1), using CPU fallback" << std::endl;
         return;
     }
     
     // Try to build kernels with error handling
-    std::cerr << "[AttentionLayer] Attempting to build kernels on first use..." << std::endl;
-    std::cerr << "[AttentionLayer] To skip kernel building (if it hangs), set: export SKIP_ATTENTION_KERNELS=1" << std::endl;
     try {
         buildKernels();
         kernels_built_ = true;
-        std::cerr << "[AttentionLayer] ✓ Kernels built successfully" << std::endl;
     } catch (const std::runtime_error& e) {
         kernel_build_failed_ = true;
         use_cpu_fallback_ = true;  // Enable CPU fallback
-        std::cerr << "[AttentionLayer] ✗ Kernel build failed: " << e.what() << std::endl;
-        std::cerr << "[AttentionLayer] Falling back to CPU implementation (works with any dimensions)" << std::endl;
-        std::cerr << "[AttentionLayer] Note: CPU fallback is slower but allows testing the full pipeline." << std::endl;
         // Don't throw - allow CPU fallback to proceed
     } catch (const std::exception& e) {
         kernel_build_failed_ = true;
         use_cpu_fallback_ = true;
-        std::cerr << "[AttentionLayer] ✗ Unexpected error during kernel build: " << e.what() << std::endl;
-        std::cerr << "[AttentionLayer] Falling back to CPU implementation" << std::endl;
         // Don't throw - allow CPU fallback
     } catch (...) {
         kernel_build_failed_ = true;
         use_cpu_fallback_ = true;
-        std::cerr << "[AttentionLayer] ✗ FATAL: Unknown exception during kernel build (possible driver crash)" << std::endl;
-        std::cerr << "[AttentionLayer] The OpenCL driver may have crashed. This is a known issue on some Android devices." << std::endl;
-        std::cerr << "[AttentionLayer] Falling back to CPU implementation (slower but functional)" << std::endl;
         // Don't throw - allow CPU fallback to proceed
     }
 }
@@ -496,13 +457,9 @@ cl_mem AttentionLayer::forward(
         
         // Check if this is the same buffer pointer as before
         if (input == last_buffer_ptr && last_buffer_ptr != nullptr) {
-            std::cout << "  [Attention Entry Debug] Same buffer pointer as before!" << std::endl;
         } else {
             if (last_buffer_ptr != nullptr) {
-                std::cout << "  [Attention Entry Debug] WARNING: Buffer pointer changed! "
-                          << "Previous=" << last_buffer_ptr << ", Current=" << input << std::endl;
             } else {
-                std::cout << "  [Attention Entry Debug] First check (storing pointer)" << std::endl;
             }
             last_buffer_ptr = input;
         }
@@ -510,8 +467,6 @@ cl_mem AttentionLayer::forward(
         // Get buffer info to compare addresses
         cl_uint buffer_mem_type = 0;
         clGetMemObjectInfo(input, CL_MEM_TYPE, sizeof(cl_uint), &buffer_mem_type, nullptr);
-        std::cout << "  [Attention Entry Debug] Buffer type=" << buffer_mem_type 
-                  << " (CL_MEM_OBJECT_BUFFER=" << CL_MEM_OBJECT_BUFFER << ")" << std::endl;
         
         std::vector<float> input_check(input_size);
         cl_int check_err = clEnqueueReadBuffer(queue, input, CL_TRUE, 0,
@@ -531,25 +486,14 @@ cl_mem AttentionLayer::forward(
             }
             
             // Check first few values of token 5 (the clean one) vs token 0 (NaN)
-            std::cout << "  [Attention Entry Debug] Input at function entry: " << nan_count 
-                      << " NaNs out of " << input_size << " values, buffer_size=" << buf_size << std::endl;
-            std::cout << "  [Attention Entry Debug] NaNs per token: ";
             for (int i = 0; i < seq_len; ++i) {
-                std::cout << "token" << i << "=" << nan_per_token[i] << "/" << d_model_ << " ";
             }
-            std::cout << std::endl;
             
             // Show sample values from token 0 and token 5
-            std::cout << "  [Attention Entry Debug] Token 0 first 5 values: ";
             for (int i = 0; i < 5; ++i) {
-                std::cout << input_check[i] << " ";
             }
-            std::cout << std::endl;
-            std::cout << "  [Attention Entry Debug] Token 5 first 5 values: ";
             for (int i = 5 * d_model_; i < 5 * d_model_ + 5; ++i) {
-                std::cout << input_check[i] << " ";
             }
-            std::cout << std::endl;
             
             // If these values match what ResidualBlock saw, then it's the same buffer content
             // This will help diagnose if the buffer was corrupted or if we're reading from wrong place
@@ -560,8 +504,6 @@ cl_mem AttentionLayer::forward(
                     break;
                 }
             }
-            std::cout << "  [Attention Entry Debug] Token 5 is " 
-                      << (token5_matches ? "VALID (non-NaN)" : "CORRUPTED (has NaN)") << std::endl;
             
             // Check if token 5 matches what we expect (should be the same as ResidualBlock saw)
             // This will help us understand if the buffer content actually changed or if it's a read issue
@@ -572,10 +514,7 @@ cl_mem AttentionLayer::forward(
                     break;
                 }
             }
-            std::cout << "  [Attention Entry Debug] Token 5 is " 
-                      << (token5_all_nan_in_attention ? "ALL NaN" : "has valid values") << std::endl;
         } else {
-            std::cout << "  [Attention Entry Debug] Failed to read buffer, err=" << check_err << std::endl;
         }
         checked_input_entry = true;
     }
@@ -664,8 +603,6 @@ cl_mem AttentionLayer::forward(
             for (float val : input_check) {
                 if (std::isnan(val)) { nan_count++; }
             }
-            std::cout << "  [Attention Input Debug] Input to attention: " << nan_count 
-                      << " NaNs out of " << input_size << " values" << std::endl;
         }
         checked_input = true;
     }
@@ -689,8 +626,6 @@ cl_mem AttentionLayer::forward(
             for (float val : qkv_check) {
                 if (std::isnan(val)) { nan_count++; }
             }
-            std::cout << "  [Attention QKV Debug] QKV output: " << nan_count 
-                      << " NaNs out of " << qkv_size << " values" << std::endl;
         }
         checked_qkv = true;
     }
@@ -830,8 +765,6 @@ cl_mem AttentionLayer::forward(
                     for (float val : keys_check) {
                         if (std::isnan(val)) { nan_count++; }
                     }
-                    std::cout << "\n  [Attention Prefill Debug] Keys before caching: " << nan_count 
-                              << " NaNs out of " << keys_size << " values" << std::endl;
                 }
                 checked_prefill_keys = true;
             }
@@ -854,8 +787,6 @@ cl_mem AttentionLayer::forward(
                         values_out.write(reinterpret_cast<const char*>(values_dump.data()), values_dump.size() * sizeof(float));
                         keys_out.close();
                         values_out.close();
-                        std::cout << "\n  [Debug] Dumped prefill KV cache: keys_size=" << keys_size 
-                                  << " values_size=" << keys_size << std::endl;
                     }
                     dumped_prefill_kv = true;
                 }
@@ -1155,8 +1086,6 @@ cl_mem AttentionLayer::step(
                 q_out.close();
                 k_out.close();
                 v_out.close();
-                std::cout << "\n  [Debug] Dumped gen step 0 QKV: q_size=" << q_size 
-                          << " kv_new_size=" << kv_size_new << std::endl;
             }
             dumped_step_qkv = true;
         }
@@ -1174,16 +1103,12 @@ cl_mem AttentionLayer::step(
         // Debug: Always print cache info (first time only)
         static bool printed_cache_info = false;
         if (!printed_cache_info) {
-            std::cout << "\n  [Attention Debug] cached_kv_len_=" << cached_kv_len_ << std::endl;
             
             if (cached_len <= 0) {
                 // Infer cached length from state buffer size
                 size_t state1_size = 0;
                 clGetMemObjectInfo(state->state1, CL_MEM_SIZE, sizeof(size_t), &state1_size, nullptr);
                 cached_len = state1_size / (batch_size * kv_heads_ * d_head_ * sizeof(float));
-                std::cout << "  [Attention Debug] Inferred cached_len=" << cached_len 
-                          << " (buffer=" << state1_size << " bytes, batch=" << batch_size 
-                          << ", kv_heads=" << kv_heads_ << ", d_head=" << d_head_ << ")" << std::endl;
             }
             
             // Check if cached keys contain NaN
@@ -1198,8 +1123,6 @@ cl_mem AttentionLayer::step(
                 for (float val : cached_keys_check) {
                     if (std::isnan(val)) { nan_count++; }
                 }
-                std::cout << "  [Attention Debug] Cached keys: " << nan_count << " NaNs out of " 
-                          << cached_keys_check.size() << " values (actual_len=" << check_len << ")" << std::endl;
             }
             
             printed_cache_info = true;
@@ -1314,8 +1237,6 @@ cl_mem AttentionLayer::step(
     // Debug: Print cached_len_for_mask for first step only
     static bool printed_cached_len_debug = false;
     if (!printed_cached_len_debug && seq_len == 1) {
-        std::cout << "\n  [Attention Step Debug] seq_len=" << seq_len << ", seq_len_kv=" << seq_len_kv 
-                  << ", cached_len_for_mask=" << cached_len_for_mask << std::endl;
         printed_cached_len_debug = true;
     }
     
@@ -1359,7 +1280,6 @@ cl_mem AttentionLayer::forwardCPU(
     LayerState* state,
     cl_command_queue queue
 ) {
-    std::cout << "\n      [CPU Fallback] Computing attention on CPU..." << std::flush;
     
     cl_context context = ctx_->getContext();
     cl_int err;
@@ -1403,7 +1323,6 @@ cl_mem AttentionLayer::forwardCPU(
         throw std::runtime_error("Failed to write CPU fallback output");
     }
     
-    std::cout << " ✓ (CPU fallback)" << std::flush;
     return output;
 }
 
