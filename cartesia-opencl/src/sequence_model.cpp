@@ -33,6 +33,15 @@ void SequenceModel::addLayer(std::unique_ptr<ResidualBlock> layer) {
     layers_.push_back(std::move(layer));
 }
 
+void SequenceModel::setPostNormWeights(const std::vector<float>& weights) {
+    if (weights.size() != static_cast<size_t>(d_model_)) {
+        throw std::runtime_error("Invalid post-norm weights size: expected " +
+                               std::to_string(d_model_) + ", got " +
+                               std::to_string(weights.size()));
+    }
+    post_norm_weights_ = weights;
+}
+
 cl_mem SequenceModel::forward(
     cl_mem input,
     int batch_size,
@@ -196,7 +205,10 @@ cl_mem SequenceModel::forward(
         if (!norm_layer_) {
             // Initialize norm layer if not already done
             norm_layer_ = std::make_unique<RMSNormLayer>(ctx_, d_model_);
-            std::vector<float> norm_weights(d_model_, 1.0f);
+            // Use actual post-norm weights if provided, otherwise default to all ones
+            std::vector<float> norm_weights = post_norm_weights_.empty() 
+                ? std::vector<float>(d_model_, 1.0f) 
+                : post_norm_weights_;
             norm_layer_->initializeWeights(norm_weights);
         }
         current = norm_layer_->forward(current, batch_size, seq_len, queue);
@@ -362,7 +374,10 @@ cl_mem SequenceModel::step(
                 std::cout << "\n      [SeqModel] Initializing post-norm layer..." << std::flush;
                 // Initialize norm layer if not already done
                 norm_layer_ = std::make_unique<RMSNormLayer>(ctx_, d_model_);
-                std::vector<float> norm_weights(d_model_, 1.0f);
+                // Use actual post-norm weights if provided, otherwise default to all ones
+                std::vector<float> norm_weights = post_norm_weights_.empty() 
+                    ? std::vector<float>(d_model_, 1.0f) 
+                    : post_norm_weights_;
                 norm_layer_->initializeWeights(norm_weights);
                 std::cout << " ✓" << std::flush;
             }

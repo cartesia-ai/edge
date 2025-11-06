@@ -49,6 +49,9 @@ public:
     
     int getDModel() const { return d_model_; }
     int getNumLayers() const { return layers_.size(); }
+    
+    // Set post-norm weights (must be called before first forward/step if using post-norm)
+    void setPostNormWeights(const std::vector<float>& weights);
 
 private:
     OpenCLContextManager* ctx_;
@@ -60,6 +63,7 @@ private:
     // RMS norm for post-norm (if needed)
     std::unique_ptr<RMSNormLayer> norm_layer_;
     bool use_post_norm_;
+    std::vector<float> post_norm_weights_;  // Store post-norm weights
 };
 
 } // namespace cartesia_opencl

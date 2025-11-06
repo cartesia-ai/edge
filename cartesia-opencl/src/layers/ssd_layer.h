@@ -47,7 +47,8 @@ public:
         const std::vector<float>& A,
         const std::vector<float>& dt_bias,
         const std::vector<float>& D,
-        const std::vector<float>& out_proj_weights
+        const std::vector<float>& out_proj_weights,
+        const std::vector<float>& rms_norm_weights
     );
     
     // Layer interface

@@ -425,6 +425,15 @@ int main(int argc, char* argv[]) {
         // Mamba2-130m uses post_norm = true (based on MLX model configuration)
         SequenceModel seq_model(&ctx_mgr, ACTUAL_D_MODEL, n_layer_repeats, true);
         
+        // Load post-norm weights
+        if (use_pretrained_weights) {
+            std::string post_norm_path = weights_dir + "/post_norm_weight.bin";
+            std::vector<float> post_norm_weights = loadWeights(post_norm_path);
+            validateWeightSize(post_norm_weights, ACTUAL_D_MODEL, "post-norm", "");
+            seq_model.setPostNormWeights(post_norm_weights);
+            std::cout << "✓ Loaded post-norm weights (" << post_norm_weights.size() << " values)" << std::endl;
+        }
+        
         // Build model
         // Pattern: 12 unique layers repeated n_layer_repeats times
         std::cout << "Building model with " << (12 * n_layer_repeats) << " layers..." << std::endl;
@@ -444,7 +453,7 @@ int main(int argc, char* argv[]) {
         
         // Helper function to create SSD layer with weights (loaded or generated)
         auto createSSDLayer = [&](int layer_idx, int expand, int kernel_size, int d_state, int d_head, int n_groups) -> SSDLayer* {
-            std::vector<float> in_proj_weights, conv_weight, conv_bias, A, dt_bias, D, out_proj_weights;
+            std::vector<float> in_proj_weights, conv_weight, conv_bias, A, dt_bias, D, out_proj_weights, rms_norm_weights;
             int d_inner, n_heads, in_proj_dim, conv_dim;
             std::string layer_dir_str;
             
@@ -552,6 +561,11 @@ int main(int argc, char* argv[]) {
                 out_proj_weights = loadWeights(layer_dir_str + "/out_proj_weight.bin");
                 validateWeightSize(out_proj_weights, ACTUAL_D_MODEL * d_inner, 
                                  "SSD out_proj", "layer " + std::to_string(layer_idx));
+                
+                // Load SSD's internal rms_norm weights (different from ResidualBlock's norm!)
+                rms_norm_weights = loadWeights(layer_dir_str + "/rms_norm_weight.bin");
+                validateWeightSize(rms_norm_weights, d_inner, 
+                                 "SSD rms_norm", "layer " + std::to_string(layer_idx));
             } else {
                 // Generate random weights
                 in_proj_weights.resize(in_proj_dim * ACTUAL_D_MODEL);
@@ -561,6 +575,7 @@ int main(int argc, char* argv[]) {
                 dt_bias.resize(n_heads);
                 D.resize(n_heads);
                 out_proj_weights.resize(ACTUAL_D_MODEL * d_inner);
+                rms_norm_weights.resize(d_inner);
                 
                 for (size_t i = 0; i < in_proj_weights.size(); ++i) in_proj_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
                 for (size_t i = 0; i < conv_weight.size(); ++i) conv_weight[i] = 0.01f * ((i % 200) - 100) / 100.0f;
@@ -569,9 +584,10 @@ int main(int argc, char* argv[]) {
                 for (float& dt : dt_bias) dt = 0.0f;
                 for (size_t i = 0; i < D.size(); ++i) D[i] = 0.1f * (i % 100) / 100.0f;
                 for (size_t i = 0; i < out_proj_weights.size(); ++i) out_proj_weights[i] = 0.01f * ((i % 200) - 100) / 100.0f;
+                for (size_t i = 0; i < rms_norm_weights.size(); ++i) rms_norm_weights[i] = 1.0f;  // RMS norm typically initialized to ones
             }
             
-            layer->initializeWeights(in_proj_weights, conv_weight, conv_bias, A, dt_bias, D, out_proj_weights);
+            layer->initializeWeights(in_proj_weights, conv_weight, conv_bias, A, dt_bias, D, out_proj_weights, rms_norm_weights);
             return layer;
         };
         
@@ -862,7 +878,7 @@ int main(int argc, char* argv[]) {
         cl_mem embeddings = embedding.encode(token_buffer, batch_size, seq_len, queue);
         std::cout << " ✓" << std::endl;
         
-        // Check embedding output for NaN
+        // Check embedding output and dump for comparison with MLX
         static bool checked_embedding = false;
         if (!checked_embedding) {
             size_t emb_size = batch_size * seq_len * ACTUAL_D_MODEL;
@@ -871,11 +887,35 @@ int main(int argc, char* argv[]) {
                 emb_size * sizeof(float), emb_check.data(), 0, nullptr, nullptr);
             if (check_err == CL_SUCCESS) {
                 int nan_count = 0;
+                float min_val = emb_check[0], max_val = emb_check[0], sum_val = 0.0f;
                 for (float val : emb_check) {
                     if (std::isnan(val)) { nan_count++; }
+                    if (!std::isnan(val) && !std::isinf(val)) {
+                        min_val = std::min(min_val, val);
+                        max_val = std::max(max_val, val);
+                        sum_val += val;
+                    }
                 }
+                float mean_val = sum_val / emb_size;
                 std::cout << "  [Embedding Debug] Embedding output: " << nan_count 
                           << " NaNs out of " << emb_size << " values" << std::endl;
+                std::cout << "  [Embedding Debug] Stats: min=" << min_val 
+                          << ", max=" << max_val << ", mean=" << mean_val << std::endl;
+                
+                // Dump embedding output for comparison with MLX
+                std::string emb_output_base = output_file;
+                size_t emb_bin_pos = emb_output_base.find(".bin");
+                if (emb_bin_pos != std::string::npos) {
+                    emb_output_base = emb_output_base.substr(0, emb_bin_pos);
+                }
+                std::string emb_output_file = emb_output_base + "_prefill_embedding_output_opencl.bin";
+                std::ofstream emb_out(emb_output_file, std::ios::binary);
+                if (emb_out.is_open()) {
+                    emb_out.write(reinterpret_cast<const char*>(emb_check.data()), emb_check.size() * sizeof(float));
+                    emb_out.close();
+                    std::cout << "  [Embedding Debug] Dumped embedding to " << emb_output_file 
+                              << " (shape: (" << batch_size << ", " << seq_len << ", " << ACTUAL_D_MODEL << "))" << std::endl;
+                }
             }
             checked_embedding = true;
         }
@@ -1034,6 +1074,36 @@ int main(int argc, char* argv[]) {
                 // Check embedding for NaN (first iteration only)
                 if (i == 0) {
                     checkForNaN(current_embedding, batch_size * ACTUAL_D_MODEL, queue, "embedding_output");
+                    
+                    // Dump embedding for token 247 for comparison with MLX
+                    std::vector<float> gen_emb_check(batch_size * ACTUAL_D_MODEL);
+                    cl_int emb_err = clEnqueueReadBuffer(queue, current_embedding, CL_TRUE, 0,
+                        gen_emb_check.size() * sizeof(float), gen_emb_check.data(), 0, nullptr, nullptr);
+                    if (emb_err == CL_SUCCESS) {
+                        float emb_min = *std::min_element(gen_emb_check.begin(), gen_emb_check.end());
+                        float emb_max = *std::max_element(gen_emb_check.begin(), gen_emb_check.end());
+                        float emb_sum = std::accumulate(gen_emb_check.begin(), gen_emb_check.end(), 0.0f);
+                        float emb_mean = emb_sum / gen_emb_check.size();
+                        std::cout << "  [Gen Debug] Token " << current_token_id << " embedding: min=" << emb_min 
+                                  << ", max=" << emb_max << ", mean=" << emb_mean << std::endl;
+                        std::cout << "  [Gen Debug] First 10: ";
+                        for (int j = 0; j < 10 && j < ACTUAL_D_MODEL; ++j) {
+                            std::cout << gen_emb_check[j] << " ";
+                        }
+                        std::cout << std::endl;
+                        
+                        // Dump to file
+                        if (!output_base.empty()) {
+                            std::string gen_emb_file = output_base + "_gen_step_0_embedding_token_" + std::to_string(current_token_id) + "_opencl.bin";
+                            std::ofstream gen_emb_out(gen_emb_file, std::ios::binary);
+                            if (gen_emb_out.is_open()) {
+                                gen_emb_out.write(reinterpret_cast<const char*>(gen_emb_check.data()), 
+                                                 gen_emb_check.size() * sizeof(float));
+                                gen_emb_out.close();
+                                std::cout << "  [Gen Debug] Dumped to " << gen_emb_file << std::endl;
+                            }
+                        }
+                    }
                 }
                 std::cout.flush();
                 

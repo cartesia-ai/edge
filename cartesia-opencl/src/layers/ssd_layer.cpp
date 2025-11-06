@@ -853,7 +853,8 @@ void SSDLayer::initializeWeights(
     const std::vector<float>& A,
     const std::vector<float>& dt_bias,
     const std::vector<float>& D,
-    const std::vector<float>& out_proj_weights
+    const std::vector<float>& out_proj_weights,
+    const std::vector<float>& rms_norm_weights
 ) {
     // Validate sizes
     if (in_proj_weights.size() != static_cast<size_t>(in_proj_dim_ * d_model_)) {
@@ -880,13 +881,19 @@ void SSDLayer::initializeWeights(
         throw std::runtime_error("Invalid out_proj weights size");
     }
     
+    // Validate rms_norm_weights size
+    if (rms_norm_weights.size() != static_cast<size_t>(d_inner_)) {
+        throw std::runtime_error("Invalid rms_norm weights size: expected " + 
+                               std::to_string(d_inner_) + ", got " + 
+                               std::to_string(rms_norm_weights.size()));
+    }
+    
     // Initialize linear layers
     in_proj_layer_->initializeWeights(in_proj_weights);
     out_proj_layer_->initializeWeights(out_proj_weights);
     
-    // Initialize RMS norm layer with ones (default initialization)
-    std::vector<float> norm_weights(d_inner_, 1.0f);
-    norm_layer_->initializeWeights(norm_weights);
+    // Initialize RMS norm layer with actual weights from file
+    norm_layer_->initializeWeights(rms_norm_weights);
     
     // Create OpenCL buffers for conv and SSM weights
     cl_context context = ctx_->getContext();
