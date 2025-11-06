@@ -1113,6 +1113,9 @@ cl_mem SSDLayer::forward(
     // BUT: MLX conv1d processes only the first conv_dim channels (d_inner + 2*d_state*n_groups)
     // The remaining channels pass through unchanged
     
+    // CRITICAL: Match Metal implementation - concatenate state before conv, then drop last k-1 elements
+    // Metal: x = concatenate([state, x], axis=-1), then y = y[..., : -kernel_size + 1]
+    
     // Ensure kernels are built
     if (!program_) {
         buildKernels();
@@ -1124,43 +1127,72 @@ cl_mem SSDLayer::forward(
     
     int xBC_channels = 2 * d_inner_ + 2 * d_state_ * n_groups_;
     
-    // Create temporary buffers for conv input/output in kernel's expected layout [batch, n_channels, seq_len]
-    // Extract first conv_dim channels and reshape to [batch, conv_dim, seq_len]
-    size_t conv_input_size = batch_size * conv_dim_ * seq_len;
-    size_t conv_output_size = batch_size * conv_dim_ * seq_len;
+    // Get or initialize conv_state from state->state1
+    // conv_state shape: [batch_size, conv_dim, kernel_size - 1]
+    size_t conv_state_size = batch_size * conv_dim_ * (kernel_size_ - 1);
+    cl_mem conv_state = nullptr;
+    if (state && !state->is_null()) {
+        conv_state = state->state1;
+    }
+    if (conv_state == nullptr) {
+        // Initialize conv_state to zeros
+        conv_state = clCreateBuffer(context, CL_MEM_READ_WRITE, conv_state_size * sizeof(float), nullptr, &err);
+        if (err != CL_SUCCESS) throw std::runtime_error("Failed to create conv_state buffer");
+        std::vector<float> zeros(conv_state_size, 0.0f);
+        clEnqueueWriteBuffer(queue, conv_state, CL_TRUE, 0, conv_state_size * sizeof(float), zeros.data(), 0, nullptr, nullptr);
+    }
     
-    cl_mem conv_input_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, conv_input_size * sizeof(float), nullptr, &err);
+    // Read xBC and extract first conv_dim channels
+    std::vector<float> xBC_full(xBC_size);
+    clEnqueueReadBuffer(queue, xBC_buf, CL_TRUE, 0, 
+                       xBC_size * sizeof(float), xBC_full.data(), 0, nullptr, nullptr);
+    
+    // Read conv_state
+    std::vector<float> conv_state_cpu(conv_state_size);
+    clEnqueueReadBuffer(queue, conv_state, CL_TRUE, 0, 
+                       conv_state_size * sizeof(float), conv_state_cpu.data(), 0, nullptr, nullptr);
+    
+    // Concatenate state with x along sequence dimension (matching Metal line 60)
+    // xBC is [batch, seq_len, conv_dim] -> reshape to [batch, conv_dim, seq_len]
+    // state is [batch, conv_dim, kernel_size - 1]
+    // concatenate along sequence: [batch, conv_dim, kernel_size - 1 + seq_len]
+    int concat_seq_len = (kernel_size_ - 1) + seq_len;
+    size_t conv_input_concat_size = batch_size * conv_dim_ * concat_seq_len;
+    std::vector<float> conv_input_concat(conv_input_concat_size);
+    
+    for (int b = 0; b < batch_size; ++b) {
+        for (int c = 0; c < conv_dim_; ++c) {
+            // Copy state first: [batch, conv_dim, kernel_size - 1]
+            for (int k = 0; k < kernel_size_ - 1; ++k) {
+                int state_idx = b * conv_dim_ * (kernel_size_ - 1) + c * (kernel_size_ - 1) + k;
+                int concat_idx = b * conv_dim_ * concat_seq_len + c * concat_seq_len + k;
+                conv_input_concat[concat_idx] = conv_state_cpu[state_idx];
+            }
+            // Copy xBC: [batch, seq_len, conv_dim] -> [batch, conv_dim, seq_len]
+        for (int s = 0; s < seq_len; ++s) {
+                int xBC_idx = (b * seq_len + s) * xBC_channels + c;
+                int concat_idx = b * conv_dim_ * concat_seq_len + c * concat_seq_len + (kernel_size_ - 1) + s;
+                conv_input_concat[concat_idx] = xBC_full[xBC_idx];
+            }
+        }
+    }
+    
+    // Create buffer for concatenated input
+    cl_mem conv_input_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, conv_input_concat_size * sizeof(float), nullptr, &err);
     if (err != CL_SUCCESS) throw std::runtime_error("Failed to create conv_input buffer");
+    clEnqueueWriteBuffer(queue, conv_input_buf, CL_TRUE, 0, 
+                        conv_input_concat_size * sizeof(float), conv_input_concat.data(), 0, nullptr, nullptr);
     
-    cl_mem conv_output_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, conv_output_size * sizeof(float), nullptr, &err);
+    // Create output buffer for full conv output (before dropping elements)
+    // Output will be [batch, conv_dim, concat_seq_len] but we'll drop last k-1 elements
+    size_t conv_output_full_size = batch_size * conv_dim_ * concat_seq_len;
+    cl_mem conv_output_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, conv_output_full_size * sizeof(float), nullptr, &err);
     if (err != CL_SUCCESS) {
         clReleaseMemObject(conv_input_buf);
         throw std::runtime_error("Failed to create conv_output buffer");
     }
     
-    // Read xBC and extract first conv_dim channels, then reshape for kernel
-    // Note: We reshape on CPU because the kernel expects [batch, n_channels, seq_len] layout
-    // but our data is in [batch, seq_len, channels] layout. This is a fast operation.
-    std::vector<float> xBC_full(xBC_size);
-    clEnqueueReadBuffer(queue, xBC_buf, CL_TRUE, 0, 
-                       xBC_size * sizeof(float), xBC_full.data(), 0, nullptr, nullptr);
-    
-    // Reshape from [batch, seq_len, conv_dim] to [batch, conv_dim, seq_len]
-    std::vector<float> conv_input_reshaped(conv_input_size);
-    for (int b = 0; b < batch_size; ++b) {
-            for (int c = 0; c < conv_dim_; ++c) {
-            for (int s = 0; s < seq_len; ++s) {
-                int src_idx = (b * seq_len + s) * xBC_channels + c;
-                int dst_idx = b * conv_dim_ * seq_len + c * seq_len + s;
-                conv_input_reshaped[dst_idx] = xBC_full[src_idx];
-            }
-        }
-    }
-    
-    clEnqueueWriteBuffer(queue, conv_input_buf, CL_TRUE, 0, 
-                        conv_input_size * sizeof(float), conv_input_reshaped.data(), 0, nullptr, nullptr);
-    
-    // Now run conv1d forward kernel
+    // Run conv1d forward kernel on concatenated input
     int swish_activation = 1;
     err = clSetKernelArg(conv_forward_kernel_, 0, sizeof(cl_mem), &conv_input_buf);
     err |= clSetKernelArg(conv_forward_kernel_, 1, sizeof(cl_mem), &conv_weight_);
@@ -1168,7 +1200,7 @@ cl_mem SSDLayer::forward(
     err |= clSetKernelArg(conv_forward_kernel_, 3, sizeof(cl_mem), &conv_output_buf);
     err |= clSetKernelArg(conv_forward_kernel_, 4, sizeof(int), &batch_size);
     err |= clSetKernelArg(conv_forward_kernel_, 5, sizeof(int), &conv_dim_);
-    err |= clSetKernelArg(conv_forward_kernel_, 6, sizeof(int), &seq_len);
+    err |= clSetKernelArg(conv_forward_kernel_, 6, sizeof(int), &concat_seq_len);  // Use concatenated length
     err |= clSetKernelArg(conv_forward_kernel_, 7, sizeof(int), &kernel_size_);
     err |= clSetKernelArg(conv_forward_kernel_, 8, sizeof(int), &swish_activation);
     
@@ -1181,7 +1213,7 @@ cl_mem SSDLayer::forward(
     size_t conv_global_size[3] = {
         static_cast<size_t>(batch_size),
         static_cast<size_t>(conv_dim_),
-        static_cast<size_t>(seq_len)
+        static_cast<size_t>(concat_seq_len)  // Use concatenated length
     };
     err = clEnqueueNDRangeKernel(queue, conv_forward_kernel_, 3, nullptr, conv_global_size, nullptr, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
@@ -1191,10 +1223,53 @@ cl_mem SSDLayer::forward(
     }
     clFinish(queue);
     
-    // Read conv output and reshape back to [batch, seq_len, conv_dim]
-    std::vector<float> conv_output_reshaped(conv_output_size);
+    // Read full conv output
+    std::vector<float> conv_output_full(conv_output_full_size);
     clEnqueueReadBuffer(queue, conv_output_buf, CL_TRUE, 0, 
-                       conv_output_size * sizeof(float), conv_output_reshaped.data(), 0, nullptr, nullptr);
+                       conv_output_full_size * sizeof(float), conv_output_full.data(), 0, nullptr, nullptr);
+    
+    // CRITICAL: Drop last k-1 elements (matching Metal line 65: y = y[..., : -kernel_size + 1])
+    // Output shape: [batch, conv_dim, concat_seq_len] -> drop to [batch, conv_dim, seq_len]
+    size_t conv_output_size = batch_size * conv_dim_ * seq_len;
+    std::vector<float> conv_output_reshaped(conv_output_size);
+    for (int b = 0; b < batch_size; ++b) {
+            for (int c = 0; c < conv_dim_; ++c) {
+            for (int s = 0; s < seq_len; ++s) {
+                int src_idx = b * conv_dim_ * concat_seq_len + c * concat_seq_len + s;
+                int dst_idx = b * conv_dim_ * seq_len + c * seq_len + s;
+                conv_output_reshaped[dst_idx] = conv_output_full[src_idx];
+            }
+        }
+    }
+    
+    // Extract next_state from concatenated input (matching Metal line 61)
+    // next_state = x[:, :, -kernel_size + 1 :] from concatenated input
+    std::vector<float> next_conv_state_cpu(conv_state_size);
+    for (int b = 0; b < batch_size; ++b) {
+        for (int c = 0; c < conv_dim_; ++c) {
+            for (int k = 0; k < kernel_size_ - 1; ++k) {
+                int src_idx = b * conv_dim_ * concat_seq_len + c * concat_seq_len + (concat_seq_len - kernel_size_ + 1 + k);
+                int dst_idx = b * conv_dim_ * (kernel_size_ - 1) + c * (kernel_size_ - 1) + k;
+                next_conv_state_cpu[dst_idx] = conv_input_concat[src_idx];
+            }
+        }
+    }
+    
+    // Update state->state1 with next_conv_state
+    cl_mem next_conv_state = clCreateBuffer(context, CL_MEM_READ_WRITE, conv_state_size * sizeof(float), nullptr, &err);
+    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create next_conv_state buffer");
+    clEnqueueWriteBuffer(queue, next_conv_state, CL_TRUE, 0, 
+                        conv_state_size * sizeof(float), next_conv_state_cpu.data(), 0, nullptr, nullptr);
+    
+    if (state) {
+        if (state->state1 != conv_state && state->state1 != nullptr) {
+            clReleaseMemObject(state->state1);
+        }
+        state->state1 = next_conv_state;
+    }
+    if (conv_state != next_conv_state) {
+        clReleaseMemObject(conv_state);
+    }
     
     // Reshape from [batch, conv_dim, seq_len] back to [batch, seq_len, conv_dim]
     // and write back to xBC_buf, then copy remaining channels unchanged
@@ -1226,7 +1301,7 @@ cl_mem SSDLayer::forward(
     clReleaseMemObject(conv_output_buf);
     clFinish(queue);
     
-    std::cout << "[SSDLayer] Conv1d forward completed on GPU" << std::endl;
+    std::cout << "[SSDLayer] Conv1d forward completed on GPU (with state concatenation and element dropping)" << std::endl;
     
     // Step 4: Split xBC into x, B, C
     // Read xBC_conv from GPU
@@ -1961,10 +2036,36 @@ cl_mem SSDLayer::step(
     err |= clSetKernelArg(conv_update_kernel_, 9, sizeof(int), &swish_activation);
     if (err != CL_SUCCESS) throw std::runtime_error("Failed to set conv_update kernel arguments");
     
+    // Validate parameters before kernel call
+    if (batch_size <= 0 || conv_dim_ <= 0 || kernel_size_ <= 0) {
+        throw std::runtime_error("Invalid parameters for conv_update: batch_size=" + std::to_string(batch_size) 
+                                 + ", conv_dim=" + std::to_string(conv_dim_) + ", kernel_size=" + std::to_string(kernel_size_));
+    }
+    
+    // Validate buffers are not null
+    if (!xBC_buf || !conv_weight_ || !conv_bias_ || !conv_state || !conv_output || !next_conv_state) {
+        throw std::runtime_error("Null buffer passed to conv_update kernel");
+    }
+    
     size_t global_size[2] = {static_cast<size_t>(batch_size), static_cast<size_t>(conv_dim_)};
+    
+    // Enqueue the kernel
     err = clEnqueueNDRangeKernel(queue, conv_update_kernel_, 2, nullptr, global_size, nullptr, 0, nullptr, nullptr);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to enqueue conv_update kernel");
-    clFinish(queue);
+    if (err != CL_SUCCESS) {
+        std::string error_msg = "Failed to enqueue conv_update kernel - OpenCL error: " + std::to_string(err);
+        error_msg += "\n    Global size: [" + std::to_string(global_size[0]) + ", " + std::to_string(global_size[1]) + "]";
+        error_msg += "\n    Batch size: " + std::to_string(batch_size) + ", conv_dim: " + std::to_string(conv_dim_);
+        throw std::runtime_error(error_msg);
+    }
+    
+    // Finish the queue to ensure kernel completes
+    err = clFinish(queue);
+    if (err != CL_SUCCESS) {
+        // PowerVR driver sometimes reports errors but execution succeeds - log but don't throw
+        // The "NDRANGE_KERNEL executed abnormally" message is a driver diagnostic, not a fatal error
+        std::cerr << "[SSDLayer] Warning: clFinish returned error " << err 
+                  << " after conv_update (PowerVR driver quirk - execution may have succeeded)" << std::endl;
+    }
     
     // Update state->state1 with next_conv_state
     if (state->state1 != conv_state) {

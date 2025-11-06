@@ -1157,12 +1157,51 @@ int main(int argc, char* argv[]) {
         // printMemoryInfo(device, "After All Steps");
         std::cout.flush();
         
-        // Cleanup - protect against double-release
+        // Cleanup - protect against double-release and invalid buffers
         std::cout << "Cleaning up prefill buffers..." << std::flush;
-        if (token_buffer) clReleaseMemObject(token_buffer);
-        if (embeddings) clReleaseMemObject(embeddings);
-        if (hidden) clReleaseMemObject(hidden);
-        std::cout << " ✓" << std::endl;
+        
+        // NOTE: embeddings and hidden are owned by their respective layers (EmbeddingLayer and SequenceModel)
+        // They will be released when the layers are destroyed, so we should NOT release them here.
+        // Only release token_buffer which we created directly.
+        
+        // Helper function to safely release a buffer (avoiding clGetMemObjectInfo which can crash)
+        auto safeRelease = [](cl_mem buf, const char* name) -> bool {
+            if (!buf) {
+                std::cout << "\n  Skipping " << name << " (already null)" << std::flush;
+                return true;
+            }
+            try {
+                std::cout << "\n  Releasing " << name << "..." << std::flush;
+                cl_int release_err = clReleaseMemObject(buf);
+                if (release_err == CL_SUCCESS) {
+                    std::cout << " ✓" << std::flush;
+                    return true;
+                } else if (release_err == CL_INVALID_MEM_OBJECT) {
+                    std::cout << " (already invalid)" << std::flush;
+                    return true;
+                } else {
+                    std::cerr << "\nWarning: Failed to release " << name << " buffer (err=" << release_err << ")" << std::endl;
+                    return false;
+                }
+            } catch (...) {
+                std::cerr << "\nException releasing " << name << std::endl;
+                return false;
+            }
+        };
+        
+        // Only release token_buffer - embeddings and hidden are owned by their layers
+        bool success = true;
+        success &= safeRelease(token_buffer, "token_buffer");
+        token_buffer = nullptr;
+        // embeddings and hidden will be cleaned up by their layer destructors
+        embeddings = nullptr;  // Just set to null, don't release
+        hidden = nullptr;       // Just set to null, don't release
+        
+        if (success) {
+            std::cout << "\n  Prefill buffers cleaned up (embeddings and hidden owned by layers)" << std::endl;
+        } else {
+            std::cout << "\n  Some buffers had issues during release" << std::endl;
+        }
         
         std::cout << std::endl;
         std::cout << "Generation complete!" << std::endl;
