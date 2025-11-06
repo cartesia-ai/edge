@@ -59,7 +59,8 @@ void OpenCLContextManager::initializeOpenCL() {
         throw std::runtime_error("Failed to create OpenCL context: " + std::to_string(err));
     }
     
-    // Create command queue
+    // Create command queue with in-order execution (flags=0) for determinism
+    // In-order execution ensures commands complete in submission order
     queue_ = clCreateCommandQueue(context_, device_, 0, &err);
     if (err != CL_SUCCESS || !queue_) {
         clReleaseContext(context_);
@@ -133,9 +134,16 @@ cl_program OpenCLContextManager::buildProgram(const std::vector<std::string>& so
         throw std::runtime_error("Failed to create OpenCL program: " + std::to_string(err));
     }
     
-    // Build options: allow override via env, default to conservative settings
+    // Build options: allow override via env, default to deterministic settings
+    // Use conservative flags to ensure deterministic floating-point behavior:
+    // - cl-opt-disable: Disable optimizations that may cause non-determinism
+    // - cl-fp32-correctly-rounded-divide-sqrt: Ensure correct rounding for div/sqrt
+    // - cl-no-signed-zeros: disabled (omitted) to preserve signed zeros
+    // - cl-mad-enable: disabled (omitted) to avoid fused multiply-add non-determinism
+    // - cl-finite-math-only: disabled (omitted) to handle NaN/Inf consistently
     const char* env_opts = std::getenv("OPENCL_BUILD_OPTS");
-    std::string build_opts = env_opts ? std::string(env_opts) : std::string("-cl-std=CL1.2 -cl-opt-disable");
+    std::string build_opts = env_opts ? std::string(env_opts) : 
+        std::string("-cl-std=CL1.2 -cl-opt-disable -cl-fp32-correctly-rounded-divide-sqrt");
     err = clBuildProgram(program, 1, &device_, build_opts.c_str(), nullptr, nullptr);
     if (err != CL_SUCCESS) {
         std::string build_log = getBuildLog(program);

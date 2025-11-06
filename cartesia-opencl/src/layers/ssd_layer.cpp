@@ -1,5 +1,6 @@
 #include "ssd_layer.h"
 #include "../opencl_context.h"
+#include "../opencl_utils.h"
 #include "linear_layer.h"
 #include "rms_norm_layer.h"
 #include <fstream>
@@ -973,19 +974,19 @@ cl_mem SSDLayer::forward(
     // Note: in_proj_out is retained by LinearLayer, we need to release it after use
     
     // Step 2: Split into z, xBC, dt
-    // Allocate buffers for z, xBC, dt
+    // Allocate buffers for z, xBC, dt (zero-initialized for determinism)
     size_t z_size = batch_size * seq_len * d_inner_;
     size_t xBC_size = batch_size * seq_len * (2 * d_inner_ + 2 * d_state_ * n_groups_);
     size_t dt_size = batch_size * seq_len * n_heads_;
     
-    cl_mem z_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, z_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create z buffer");
+    cl_mem z_buf = createAndZeroBuffer(context, queue, z_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !z_buf) throw std::runtime_error("Failed to create z buffer");
     
-    cl_mem xBC_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, xBC_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create xBC buffer");
+    cl_mem xBC_buf = createAndZeroBuffer(context, queue, xBC_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !xBC_buf) throw std::runtime_error("Failed to create xBC buffer");
     
-    cl_mem dt_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, dt_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create dt buffer");
+    cl_mem dt_buf = createAndZeroBuffer(context, queue, dt_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !dt_buf) throw std::runtime_error("Failed to create dt buffer");
     
     // Split in_proj output (uses GPU kernel if available, CPU fallback otherwise)
     splitInProjOutput(in_proj_out, batch_size, seq_len, z_buf, xBC_buf, dt_buf, queue);
@@ -1763,12 +1764,12 @@ cl_mem SSDLayer::step(
     size_t xBC_size = batch_size * (d_inner_ + 2 * d_state_ * n_groups_);
     size_t dt_size = batch_size * n_heads_;
     
-    cl_mem z_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, z_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create z buffer");
-    cl_mem xBC_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, xBC_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create xBC buffer");
-    cl_mem dt_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, dt_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create dt buffer");
+    cl_mem z_buf = createAndZeroBuffer(context, queue, z_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !z_buf) throw std::runtime_error("Failed to create z buffer");
+    cl_mem xBC_buf = createAndZeroBuffer(context, queue, xBC_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !xBC_buf) throw std::runtime_error("Failed to create xBC buffer");
+    cl_mem dt_buf = createAndZeroBuffer(context, queue, dt_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !dt_buf) throw std::runtime_error("Failed to create dt buffer");
     
     splitInProjOutput(in_proj_output, batch_size, 1, z_buf, xBC_buf, dt_buf, queue);
     clFinish(queue);

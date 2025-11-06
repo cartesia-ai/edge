@@ -4,6 +4,9 @@ project(CartesiaOpenCL CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Debug option - controls whether debug macros are compiled in
+option(ENABLE_DEBUG "Enable debug output macros" OFF)
+
 # Find OpenCL - on Android, we need to look in system/vendor paths
 find_library(OpenCL_LIBRARY
     NAMES OpenCL
@@ -58,6 +61,7 @@ set(OPENCL_HEADER_CANDIDATES
     "/opt/homebrew/include/CL/cl.h"
     "/usr/local/include/CL/cl.h"
     "/usr/include/CL/cl.h"
+    "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/OpenCL.framework/Versions/A/Headers/cl.h"
 )
 
 # Also check CMAKE_PREFIX_PATH entries
@@ -73,17 +77,31 @@ foreach(header_file ${OPENCL_HEADER_CANDIDATES})
         # Extract the directory containing CL/ (the include directory)
         # If header is at /path/include/CL/cl.h, we want /path/include
         # If header is at /path/CL/cl.h, we want /path
-        get_filename_component(header_dir "${header_file}" DIRECTORY)  # Gets .../CL
-        get_filename_component(include_dir "${header_dir}" DIRECTORY)   # Gets parent of CL
+        # If header is at .../OpenCL.framework/.../Headers/cl.h, use Headers dir
+        get_filename_component(header_dir "${header_file}" DIRECTORY)  # Gets .../Headers or .../CL
         
-        # Check if we have /path/include/CL/cl.h or /path/CL/cl.h
-        get_filename_component(include_dir_name "${include_dir}" NAME)
-        if(include_dir_name STREQUAL "include")
-            # Header is at /path/include/CL/cl.h, use /path/include
-            set(OpenCL_INCLUDE_DIR "${include_dir}")
+        # Check if this is a macOS framework
+        if(header_dir MATCHES "OpenCL\\.framework")
+            # For framework, create a CL symlink in build dir and use that
+            file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/opencl_compat/CL")
+            file(GLOB OPENCL_HEADERS "${header_dir}/*.h")
+            foreach(header ${OPENCL_HEADERS})
+                get_filename_component(header_name "${header}" NAME)
+                file(CREATE_LINK "${header}" "${CMAKE_BINARY_DIR}/opencl_compat/CL/${header_name}" SYMBOLIC)
+            endforeach()
+            set(OpenCL_INCLUDE_DIR "${CMAKE_BINARY_DIR}/opencl_compat")
         else()
-            # Header is at /path/CL/cl.h, use /path
-            set(OpenCL_INCLUDE_DIR "${include_dir}")
+            get_filename_component(include_dir "${header_dir}" DIRECTORY)   # Gets parent of CL
+            
+            # Check if we have /path/include/CL/cl.h or /path/CL/cl.h
+            get_filename_component(include_dir_name "${include_dir}" NAME)
+            if(include_dir_name STREQUAL "include")
+                # Header is at /path/include/CL/cl.h, use /path/include
+                set(OpenCL_INCLUDE_DIR "${include_dir}")
+            else()
+                # Header is at /path/CL/cl.h, use /path
+                set(OpenCL_INCLUDE_DIR "${include_dir}")
+            endif()
         endif()
         message(STATUS "  Found OpenCL headers at: ${OpenCL_INCLUDE_DIR} (checked ${header_file})")
         break()
@@ -125,6 +143,14 @@ target_include_directories(cartesia_opencl_test PRIVATE
     ${OpenCL_INCLUDE_DIR}
 )
 
+# Add ENABLE_DEBUG compile definition if option is ON
+if(ENABLE_DEBUG)
+    target_compile_definitions(cartesia_opencl_test PRIVATE ENABLE_DEBUG)
+    message(STATUS "Debug macros enabled - use CARTESIA_DEBUG_TOKENS=1 or CARTESIA_DEBUG_LOGITS=1 at runtime")
+else()
+    message(STATUS "Debug macros disabled - set ENABLE_DEBUG=ON to enable")
+endif()
+
 # target_include_directories(test_tokenizer PRIVATE 
 #     ${CMAKE_CURRENT_SOURCE_DIR}
 # )
@@ -162,7 +188,12 @@ if(ANDROID)
     )
 else()
     # For native builds, use the found library
-    target_link_libraries(cartesia_opencl_test ${OpenCL_LIBRARY})
+    if(APPLE)
+        # On macOS, link against the OpenCL framework
+        target_link_libraries(cartesia_opencl_test "-framework OpenCL")
+    else()
+        target_link_libraries(cartesia_opencl_test ${OpenCL_LIBRARY})
+    endif()
 endif()
 
 # Set rpath to find OpenCL at runtime on Android

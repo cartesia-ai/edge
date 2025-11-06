@@ -221,6 +221,50 @@ int main(int argc, char* argv[]) {
         // Use fixed seed for reproducible weights (for MLX comparison)
         std::srand(42);  // Fixed seed instead of time-based
         
+        // Try to locate and load tokenizer (for both text input and decoding output)
+        BPETokenizer tokenizer;
+        bool tokenizer_loaded = false;
+        
+        if (use_pretrained_weights) {
+            // Try to locate tokenizer files
+            std::string tokenizer_dir = weights_dir + "/tokenizer";
+            std::string vocab_path = tokenizer_dir + "/vocab.json";
+            std::string merges_path = tokenizer_dir + "/merges.txt";
+            
+            // Check if tokenizer files exist in tokenizer subdirectory
+            std::ifstream vocab_test(vocab_path);
+            std::ifstream merges_test(merges_path);
+            
+            if (!vocab_test.good() || !merges_test.good()) {
+                // Try weights_dir directly
+                vocab_path = weights_dir + "/vocab.json";
+                merges_path = weights_dir + "/merges.txt";
+                vocab_test.close();
+                merges_test.close();
+                
+                vocab_test.open(vocab_path);
+                merges_test.open(merges_path);
+            }
+            
+            if (vocab_test.good() && merges_test.good()) {
+                vocab_test.close();
+                merges_test.close();
+                
+                // Load tokenizer
+                std::cout << "Loading tokenizer from: " << vocab_path << " and " << merges_path << std::endl;
+                if (tokenizer.loadFromFiles(vocab_path, merges_path)) {
+                    std::cout << "✓ Tokenizer loaded (vocab size: " << tokenizer.getVocabSize() << ")" << std::endl;
+                    tokenizer_loaded = true;
+                } else {
+                    std::cout << "Warning: Failed to load tokenizer files" << std::endl;
+                }
+            } else {
+                vocab_test.close();
+                merges_test.close();
+                std::cout << "Note: Tokenizer files not found (vocab.json/merges.txt)" << std::endl;
+            }
+        }
+        
         // Detect if input is a file or text
         std::vector<int32_t> prompt_tokens;
         std::ifstream test_file(input_arg);
@@ -242,56 +286,17 @@ int main(int argc, char* argv[]) {
             is_text_input = true;
             std::cout << "Detected text input: \"" << input_arg << "\"" << std::endl;
             
-            if (!use_pretrained_weights) {
-                std::cerr << "Error: Text input requires weights directory to locate tokenizer files" << std::endl;
-                std::cerr << "Usage: " << argv[0] << " \"text\" <weights_dir> [output_file.bin] [max_tokens]" << std::endl;
-                return 1;
-            }
-            
-            // Try to locate tokenizer files
-            std::string tokenizer_dir = weights_dir + "/tokenizer";
-            std::string vocab_path = tokenizer_dir + "/vocab.json";
-            std::string merges_path = tokenizer_dir + "/merges.txt";
-            
-            // Check if tokenizer files exist in tokenizer subdirectory
-            std::ifstream vocab_test(vocab_path);
-            std::ifstream merges_test(merges_path);
-            
-            if (!vocab_test.good() || !merges_test.good()) {
-                // Try weights_dir directly
-                vocab_path = weights_dir + "/vocab.json";
-                merges_path = weights_dir + "/merges.txt";
-                vocab_test.close();
-                merges_test.close();
-                
-                vocab_test.open(vocab_path);
-                merges_test.open(merges_path);
-                
-                if (!vocab_test.good() || !merges_test.good()) {
-                    vocab_test.close();
-                    merges_test.close();
-                    std::cerr << "Error: Tokenizer files not found. Expected:" << std::endl;
-                    std::cerr << "  " << tokenizer_dir << "/vocab.json" << std::endl;
-                    std::cerr << "  " << tokenizer_dir << "/merges.txt" << std::endl;
-                    std::cerr << "Or:" << std::endl;
-                    std::cerr << "  " << weights_dir << "/vocab.json" << std::endl;
-                    std::cerr << "  " << weights_dir << "/merges.txt" << std::endl;
-                    std::cerr << std::endl;
-                    std::cerr << "Please download tokenizer files from Hugging Face model or use binary token file input." << std::endl;
-                    return 1;
+            if (!tokenizer_loaded) {
+                std::cerr << "Error: Text input requires tokenizer files (vocab.json/merges.txt)" << std::endl;
+                std::cerr << "Expected locations:" << std::endl;
+                if (use_pretrained_weights) {
+                    std::cerr << "  " << weights_dir << "/tokenizer/vocab.json and merges.txt" << std::endl;
+                    std::cerr << "  Or: " << weights_dir << "/vocab.json and merges.txt" << std::endl;
+                } else {
+                    std::cerr << "  Provide weights_dir argument with tokenizer files" << std::endl;
                 }
-            }
-            vocab_test.close();
-            merges_test.close();
-            
-            // Load and use tokenizer
-            std::cout << "Loading tokenizer from: " << vocab_path << " and " << merges_path << std::endl;
-            BPETokenizer tokenizer;
-            if (!tokenizer.loadFromFiles(vocab_path, merges_path)) {
-                std::cerr << "Error: Failed to load tokenizer files" << std::endl;
                 return 1;
             }
-            std::cout << "✓ Tokenizer loaded (vocab size: " << tokenizer.getVocabSize() << ")" << std::endl;
             
             // Tokenize text
             std::cout << "Tokenizing text..." << std::endl;
@@ -761,6 +766,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Running prefill on " << seq_len << " tokens..." << std::endl;
         std::cout << "  Step 1: Encoding tokens..." << std::flush;
         cl_mem embeddings = embedding.encode(token_buffer, batch_size, seq_len, queue);
+        clFinish(queue);  // Ensure embedding completion for determinism
         std::cout << " ✓" << std::endl;
         
         
@@ -774,6 +780,7 @@ int main(int argc, char* argv[]) {
         output_base = output_base.substr(0, bin_pos);
     }
     cl_mem hidden = seq_model.forward(embeddings, batch_size, seq_len, &states, queue, output_base);
+    clFinish(queue);  // Ensure forward pass completion for determinism
     std::cout << " ✓" << std::endl;
     
     
@@ -803,6 +810,7 @@ int main(int argc, char* argv[]) {
     
     // Apply LM head to last token only (batch_size=1)
     cl_mem prefill_logits = lm_head.forward(last_token_hidden_buf, batch_size, queue);
+    clFinish(queue);  // Ensure LM head completion for determinism
     std::cout << " ✓" << std::endl;
     
     // Read logits for the last token
@@ -991,6 +999,21 @@ int main(int argc, char* argv[]) {
             std::cout << "Writing output to: " << output_file << std::endl;
             writeTokenFile(output_file, generated_tokens);
             std::cout << "✓ Output written (" << generated_tokens.size() << " tokens)" << std::endl;
+            
+            // Decode and display generated text if tokenizer is loaded
+            if (tokenizer_loaded) {
+                std::cout << std::endl;
+                std::cout << "========================================" << std::endl;
+                std::cout << "Generated Text:" << std::endl;
+                std::cout << "========================================" << std::endl;
+                std::string decoded_text = tokenizer.decode(generated_tokens);
+                std::cout << decoded_text << std::endl;
+                std::cout << "========================================" << std::endl;
+            } else {
+                std::cout << std::endl;
+                std::cout << "Note: Tokenizer not loaded - text decoding not available" << std::endl;
+                std::cout << "To decode tokens, ensure tokenizer files (vocab.json/merges.txt) are in weights directory" << std::endl;
+            }
         } else {
             std::cout << "Warning: No tokens generated, skipping output file write" << std::endl;
         }

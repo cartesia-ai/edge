@@ -1,10 +1,12 @@
 #include "linear_layer.h"
 #include "../opencl_context.h"
+#include "../opencl_utils.h"
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <iostream>
 #include <CL/cl.h>
+#include <vector>
 
 namespace cartesia_opencl {
 
@@ -230,11 +232,11 @@ cl_mem LinearLayer::forward(cl_mem input, int batch_size, int seq_len, cl_comman
     int total_rows = batch_size * seq_len;
     size_t output_size = total_rows * output_dim_ * sizeof(float);
     
-    // Allocate output buffer (always recreate to avoid stale handles on some drivers)
+    // Allocate output buffer (zero-initialized for determinism)
     if (output_buffer_) { clReleaseMemObject(output_buffer_); output_buffer_ = nullptr; }
     {
         cl_int buf_err = CL_SUCCESS;
-        output_buffer_ = clCreateBuffer(context, CL_MEM_READ_WRITE, output_size, nullptr, &buf_err);
+        output_buffer_ = createAndZeroBuffer(context, queue, output_size, &buf_err);
         if (buf_err != CL_SUCCESS || !output_buffer_) {
             std::stringstream ss; ss << "Failed to create linear layer output buffer (forward), err=" << buf_err
             << ", size=" << output_size;
@@ -322,11 +324,11 @@ cl_mem LinearLayer::step(cl_mem input, int batch_size, cl_command_queue queue) {
     cl_context context = ctx_->getContext();
     size_t output_size = batch_size * output_dim_ * sizeof(float);
     
-    // Allocate output buffer (always recreate to avoid stale handles)
+    // Allocate output buffer (zero-initialized for determinism)
     if (output_buffer_) { clReleaseMemObject(output_buffer_); output_buffer_ = nullptr; }
     {
         cl_int buf_err = CL_SUCCESS;
-        output_buffer_ = clCreateBuffer(context, CL_MEM_READ_WRITE, output_size, nullptr, &buf_err);
+        output_buffer_ = createAndZeroBuffer(context, queue, output_size, &buf_err);
         if (buf_err != CL_SUCCESS || !output_buffer_) {
             std::stringstream ss; ss << "Failed to create linear layer output buffer (step), err=" << buf_err
             << ", size=" << output_size;

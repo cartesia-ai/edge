@@ -271,6 +271,12 @@ bool BPETokenizer::loadFromFiles(const std::string& vocab_path, const std::strin
         return false;
     }
     
+    // Build reverse vocabulary map for decoding
+    id_to_token_.clear();
+    for (const auto& pair : vocab_) {
+        id_to_token_[pair.second] = pair.first;
+    }
+    
     // Load merges.txt
     std::ifstream merges_file(merges_path);
     if (!merges_file.is_open()) {
@@ -559,5 +565,61 @@ std::vector<int32_t> BPETokenizer::tokenize(const std::string& text) {
     
     // Step 3: Map tokens to IDs
     return mapToIDs(bpe_tokens);
+}
+
+std::string BPETokenizer::decode(const std::vector<int32_t>& token_ids) {
+    if (!loaded_) {
+        std::cerr << "Error: Tokenizer not loaded. Call loadFromFiles() first." << std::endl;
+        return "";
+    }
+    
+    // Step 1: Map token IDs back to token strings
+    std::vector<std::string> tokens;
+    for (int32_t id : token_ids) {
+        auto it = id_to_token_.find(id);
+        if (it != id_to_token_.end()) {
+            tokens.push_back(it->second);
+        } else {
+            // Unknown token ID - skip or use placeholder
+            std::cerr << "Warning: Unknown token ID " << id << " in decode" << std::endl;
+        }
+    }
+    
+    // Step 2: Concatenate all token strings
+    std::string encoded_text;
+    for (const auto& token : tokens) {
+        encoded_text += token;
+    }
+    
+    // Step 3: Decode bytes back to UTF-8 text
+    // The tokens are in the byte-encoded format, so we need to decode them
+    // Each character in encoded_text represents a byte via the byte encoder mapping
+    std::string decoded_text;
+    size_t i = 0;
+    while (i < encoded_text.length()) {
+        // Try to match multi-byte UTF-8 sequences first (longest match)
+        bool matched = false;
+        
+        // Try 4-byte, 3-byte, 2-byte, then 1-byte UTF-8 sequences
+        for (int len = 4; len >= 1 && !matched; --len) {
+            if (i + len <= encoded_text.length()) {
+                std::string utf8_seq = encoded_text.substr(i, len);
+                auto it = byte_decoder_.find(utf8_seq);
+                if (it != byte_decoder_.end()) {
+                    decoded_text += static_cast<char>(it->second);
+                    i += len;
+                    matched = true;
+                }
+            }
+        }
+        
+        if (!matched) {
+            // Fallback: treat as literal character
+            decoded_text += encoded_text[i];
+            i++;
+        }
+    }
+    
+    return decoded_text;
 }
 

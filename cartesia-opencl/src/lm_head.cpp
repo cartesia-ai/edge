@@ -1,5 +1,6 @@
 #include "lm_head.h"
 #include "opencl_context.h"
+#include "opencl_utils.h"
 #include <stdexcept>
 #include <vector>
 #include <numeric>
@@ -117,13 +118,14 @@ cl_mem LMHead::forward(cl_mem hidden_states, int batch_size, cl_command_queue qu
     cl_context context = ctx_->getContext();
     size_t output_size = batch_size * vocab_size_ * sizeof(float);
     
-    // Allocate or resize output buffer
+    // Allocate or resize output buffer (zero-initialized for determinism)
     if (!output_buffer_ || output_buffer_size_ < output_size) {
         if (output_buffer_) clReleaseMemObject(output_buffer_);
         
         // Use READ_WRITE so downstream code can read logits from this buffer
-        output_buffer_ = clCreateBuffer(context, CL_MEM_READ_WRITE, output_size, nullptr, nullptr);
-        if (!output_buffer_) {
+        cl_int buf_err = CL_SUCCESS;
+        output_buffer_ = createAndZeroBuffer(context, queue, output_size, &buf_err);
+        if (!output_buffer_ || buf_err != CL_SUCCESS) {
             throw std::runtime_error("Failed to create LM head output buffer");
         }
         output_buffer_size_ = output_size;

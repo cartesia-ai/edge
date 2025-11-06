@@ -31,6 +31,13 @@ public:
     std::vector<int32_t> tokenize(const std::string& text);
     
     /**
+     * Decode token IDs back to text
+     * @param token_ids Vector of token IDs to decode
+     * @return Decoded text string
+     */
+    std::string decode(const std::vector<int32_t>& token_ids);
+    
+    /**
      * Check if tokenizer is loaded
      * @return true if loaded, false otherwise
      */
@@ -45,6 +52,9 @@ public:
 private:
     // Vocabulary: token string -> token ID
     std::unordered_map<std::string, int32_t> vocab_;
+    
+    // Reverse vocabulary: token ID -> token string (for decoding)
+    std::unordered_map<int32_t, std::string> id_to_token_;
     
     // BPE merge rules: (token1, token2) -> priority (lower = higher priority)
     std::map<std::pair<std::string, std::string>, int> bpe_ranks_;
