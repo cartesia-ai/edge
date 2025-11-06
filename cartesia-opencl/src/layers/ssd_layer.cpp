@@ -690,43 +690,241 @@ __kernel void compute_ssm_output_kernel(
             // Keep kernels as nullptr
         }
         
-        // SSM forward kernels (for prefill) - build a separate program for these
-        // WARNING: PowerVR OpenCL driver crashes (segfault) when building these kernels
-        // This is a known driver bug. We skip them entirely to avoid crashes.
-        // The model will use CPU fallback for prefill SSM computation.
+        // SSM forward kernels (for prefill) - build each kernel separately to avoid PowerVR driver crashes
+        // PowerVR driver crashes when building large kernel programs, so we build each kernel individually
         
-        // DO NOT attempt to build SSM forward kernels on PowerVR - it causes driver crash
-        // Uncomment below to test on other drivers, but keep commented for PowerVR
-        /*
+        // Split the SSM forward source into individual kernel sources
+        const char* process_dt_source = R"(
+#define SOFTPLUS(x) ((x > 20.0f) ? x : log1p(exp(x)))
+
+__kernel void process_dt_kernel(
+    __global const float* dt,
+    __global const float* dt_bias,
+    __global float* dt_processed,
+    const int batch_size,
+    const int seq_len,
+    const int n_heads,
+    const float dt_min,
+    const float dt_max
+) {
+    const int idx = get_global_id(0);
+    const int total = batch_size * seq_len * n_heads;
+    if (idx >= total) return;
+    
+    int h = idx % n_heads;
+    float dt_val = dt[idx] + dt_bias[h];
+    dt_val = SOFTPLUS(dt_val);
+    if (dt_val < dt_min) dt_val = dt_min;
+    if (dt_val > dt_max) dt_val = dt_max;
+    
+    dt_processed[idx] = dt_val;
+}
+)";
+
+        const char* compute_dtA_source = R"(
+__kernel void compute_dtA_kernel(
+    __global const float* dt,
+    __global const float* A,
+    __global float* dtA,
+    const int batch_size,
+    const int seq_len,
+    const int n_heads
+) {
+    const int idx = get_global_id(0);
+    const int total = batch_size * seq_len * n_heads;
+    if (idx >= total) return;
+    
+    int h = idx % n_heads;
+    dtA[idx] = dt[idx] * A[h];
+}
+)";
+
+        const char* compute_segsum_source = R"(
+__kernel void compute_segsum_decay_kernel(
+    __global const float* dtA,
+    __global float* decay,
+    const int batch_size,
+    const int seq_len,
+    const int n_heads
+) {
+    const int b = get_global_id(0);
+    const int h = get_global_id(1);
+    const int s = get_global_id(2);
+    
+    if (b >= batch_size || h >= n_heads || s >= seq_len) return;
+    
+    for (int t = 0; t < seq_len; ++t) {
+        float segsum_val = 0.0f;
+        for (int k = t + 1; k <= s; ++k) {
+            int dtA_idx = (b * seq_len + k) * n_heads + h;
+            segsum_val += dtA[dtA_idx];
+        }
+        int decay_idx = (b * n_heads + h) * seq_len * seq_len + s * seq_len + t;
+        decay[decay_idx] = exp(segsum_val);
+    }
+}
+)";
+
+        const char* compute_CB_source = R"(
+__kernel void compute_CB_kernel(
+    __global const float* B,
+    __global const float* C,
+    __global float* CB,
+    const int batch_size,
+    const int seq_len,
+    const int n_groups,
+    const int d_state
+) {
+    const int b = get_global_id(0);
+    const int s = get_global_id(1);
+    const int t = get_global_id(2);
+    
+    if (b >= batch_size || s >= seq_len || t >= seq_len) return;
+    
+    for (int g = 0; g < n_groups; ++g) {
+        float sum = 0.0f;
+        for (int state_i = 0; state_i < d_state; ++state_i) {
+            int C_idx = (b * seq_len + s) * (n_groups * d_state) + g * d_state + state_i;
+            int B_idx = (b * seq_len + t) * (n_groups * d_state) + g * d_state + state_i;
+            sum += C[C_idx] * B[B_idx];
+        }
+        int CB_idx = ((b * n_groups + g) * seq_len + s) * seq_len + t;
+        CB[CB_idx] = sum;
+    }
+}
+)";
+
+        const char* compute_ssm_output_source = R"(
+__kernel void compute_ssm_output_kernel(
+    __global const float* CB,
+    __global const float* decay,
+    __global const float* dtx,
+    __global const float* D,
+    __global const float* x,
+    __global float* y,
+    const int batch_size,
+    const int seq_len,
+    const int n_heads,
+    const int d_head,
+    const int n_groups,
+    const int d_state
+) {
+    const int b = get_global_id(0);
+    const int s = get_global_id(1);
+    const int h = get_global_id(2);
+    
+    if (b >= batch_size || s >= seq_len || h >= n_heads) return;
+    
+    int group_idx = h % n_groups;
+    
+    for (int d = 0; d < d_head; ++d) {
+        int x_idx = (b * seq_len + s) * (n_heads * d_head) + h * d_head + d;
+        float output_sum = 0.0f;
+        
+        for (int t = 0; t <= s; ++t) {
+            int x_t_idx = (b * seq_len + t) * (n_heads * d_head) + h * d_head + d;
+            float dtx_t = dtx[x_t_idx];
+            
+            int decay_idx = (b * n_heads + h) * seq_len * seq_len + s * seq_len + t;
+            float decay_st = decay[decay_idx];
+            
+            int CB_idx = ((b * n_groups + group_idx) * seq_len + s) * seq_len + t;
+            float CB_st = CB[CB_idx];
+            
+            output_sum += CB_st * decay_st * dtx_t;
+        }
+        
+        output_sum += D[h] * x[x_idx];
+        y[x_idx] = output_sum;
+    }
+}
+)";
+
+        // Build each kernel separately to avoid PowerVR driver crashes
+        int kernels_built = 0;
+        
         try {
-            std::vector<std::string> ssm_forward_sources = {std::string(ssm_forward_cl_source)};
-            std::string ssm_forward_cache_key = ctx_mgr.generateCacheKey(ssm_forward_sources) + "_ssm_forward";
-            
-            cl_program ssm_forward_program = ctx_mgr.buildProgram(ssm_forward_sources, ssm_forward_cache_key);
-            
-            if (ssm_forward_program) {
-                process_dt_kernel_ = ctx_mgr.getKernel(ssm_forward_program, "process_dt_kernel");
-                
-                compute_dtA_kernel_ = ctx_mgr.getKernel(ssm_forward_program, "compute_dtA_kernel");
-                
-                compute_segsum_decay_kernel_ = ctx_mgr.getKernel(ssm_forward_program, "compute_segsum_decay_kernel");
-                
-                compute_CB_kernel_ = ctx_mgr.getKernel(ssm_forward_program, "compute_CB_kernel");
-                
-                compute_ssm_output_kernel_ = ctx_mgr.getKernel(ssm_forward_program, "compute_ssm_output_kernel");
-                
-                // Store the program for cleanup (we'll need to add a member variable for this)
-                // For now, we'll just keep the kernels and release the program
-                clReleaseProgram(ssm_forward_program);
-                
-            } else {
+            std::vector<std::string> dt_sources = {std::string(process_dt_source)};
+            std::string dt_cache_key = ctx_mgr.generateCacheKey(dt_sources) + "_process_dt";
+            cl_program dt_program = ctx_mgr.buildProgram(dt_sources, dt_cache_key);
+            if (dt_program) {
+                process_dt_kernel_ = ctx_mgr.getKernel(dt_program, "process_dt_kernel");
+                clReleaseProgram(dt_program);
+                kernels_built++;
             }
         } catch (const std::exception& e) {
-            // Keep kernels as nullptr - forward() will check and use CPU fallback
+            std::cerr << "[SSD] Failed to build process_dt kernel: " << e.what() << std::endl;
         } catch (...) {
-            // Keep kernels as nullptr
+            std::cerr << "[SSD] Failed to build process_dt kernel (unknown error)" << std::endl;
         }
-        */
+        
+        try {
+            std::vector<std::string> dtA_sources = {std::string(compute_dtA_source)};
+            std::string dtA_cache_key = ctx_mgr.generateCacheKey(dtA_sources) + "_compute_dtA";
+            cl_program dtA_program = ctx_mgr.buildProgram(dtA_sources, dtA_cache_key);
+            if (dtA_program) {
+                compute_dtA_kernel_ = ctx_mgr.getKernel(dtA_program, "compute_dtA_kernel");
+                clReleaseProgram(dtA_program);
+                kernels_built++;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[SSD] Failed to build compute_dtA kernel: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[SSD] Failed to build compute_dtA kernel (unknown error)" << std::endl;
+        }
+        
+        try {
+            std::vector<std::string> segsum_sources = {std::string(compute_segsum_source)};
+            std::string segsum_cache_key = ctx_mgr.generateCacheKey(segsum_sources) + "_compute_segsum";
+            cl_program segsum_program = ctx_mgr.buildProgram(segsum_sources, segsum_cache_key);
+            if (segsum_program) {
+                compute_segsum_decay_kernel_ = ctx_mgr.getKernel(segsum_program, "compute_segsum_decay_kernel");
+                clReleaseProgram(segsum_program);
+                kernels_built++;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[SSD] Failed to build compute_segsum kernel: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[SSD] Failed to build compute_segsum kernel (unknown error)" << std::endl;
+        }
+        
+        try {
+            std::vector<std::string> CB_sources = {std::string(compute_CB_source)};
+            std::string CB_cache_key = ctx_mgr.generateCacheKey(CB_sources) + "_compute_CB";
+            cl_program CB_program = ctx_mgr.buildProgram(CB_sources, CB_cache_key);
+            if (CB_program) {
+                compute_CB_kernel_ = ctx_mgr.getKernel(CB_program, "compute_CB_kernel");
+                clReleaseProgram(CB_program);
+                kernels_built++;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[SSD] Failed to build compute_CB kernel: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[SSD] Failed to build compute_CB kernel (unknown error)" << std::endl;
+        }
+        
+        try {
+            std::vector<std::string> output_sources = {std::string(compute_ssm_output_source)};
+            std::string output_cache_key = ctx_mgr.generateCacheKey(output_sources) + "_compute_output";
+            cl_program output_program = ctx_mgr.buildProgram(output_sources, output_cache_key);
+            if (output_program) {
+                compute_ssm_output_kernel_ = ctx_mgr.getKernel(output_program, "compute_ssm_output_kernel");
+                clReleaseProgram(output_program);
+                kernels_built++;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[SSD] Failed to build compute_ssm_output kernel: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[SSD] Failed to build compute_ssm_output kernel (unknown error)" << std::endl;
+        }
+        
+        if (kernels_built == 5) {
+            std::cout << "[SSD] ✓ All 5 SSM forward kernels built successfully (GPU acceleration enabled)" << std::endl;
+        } else if (kernels_built > 0) {
+            std::cout << "[SSD] ⚠ Partial kernel build: " << kernels_built << "/5 kernels built (hybrid GPU/CPU mode)" << std::endl;
+        } else {
+            std::cout << "[SSD] ⚠ No SSM forward kernels built (CPU fallback mode)" << std::endl;
+        }
     } catch (const std::exception& e) {
         // Clean up what we created - but be very careful about order
         // Release kernels first, then program
@@ -1020,11 +1218,9 @@ cl_mem SSDLayer::forward(
         conv_state = state->state1;
     }
     if (conv_state == nullptr) {
-        // Initialize conv_state to zeros
-        conv_state = clCreateBuffer(context, CL_MEM_READ_WRITE, conv_state_size * sizeof(float), nullptr, &err);
-        if (err != CL_SUCCESS) throw std::runtime_error("Failed to create conv_state buffer");
-        std::vector<float> zeros(conv_state_size, 0.0f);
-        clEnqueueWriteBuffer(queue, conv_state, CL_TRUE, 0, conv_state_size * sizeof(float), zeros.data(), 0, nullptr, nullptr);
+        // Initialize conv_state to zeros (CRITICAL for determinism)
+        conv_state = createAndZeroBuffer(context, queue, conv_state_size * sizeof(float), &err);
+        if (err != CL_SUCCESS || !conv_state) throw std::runtime_error("Failed to create conv_state buffer");
     }
     
     // Read xBC and extract first conv_dim channels
@@ -1062,17 +1258,17 @@ cl_mem SSDLayer::forward(
         }
     }
     
-    // Create buffer for concatenated input
-    cl_mem conv_input_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, conv_input_concat_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create conv_input buffer");
+    // Create buffer for concatenated input (zero-initialized for determinism)
+    cl_mem conv_input_buf = createAndZeroBuffer(context, queue, conv_input_concat_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !conv_input_buf) throw std::runtime_error("Failed to create conv_input buffer");
     clEnqueueWriteBuffer(queue, conv_input_buf, CL_TRUE, 0, 
                         conv_input_concat_size * sizeof(float), conv_input_concat.data(), 0, nullptr, nullptr);
     
-    // Create output buffer for full conv output (before dropping elements)
+    // Create output buffer for full conv output (before dropping elements) - zero-initialized for determinism
     // Output will be [batch, conv_dim, concat_seq_len] but we'll drop last k-1 elements
     size_t conv_output_full_size = batch_size * conv_dim_ * concat_seq_len;
-    cl_mem conv_output_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, conv_output_full_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) {
+    cl_mem conv_output_buf = createAndZeroBuffer(context, queue, conv_output_full_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !conv_output_buf) {
         clReleaseMemObject(conv_input_buf);
         throw std::runtime_error("Failed to create conv_output buffer");
     }
@@ -1140,9 +1336,9 @@ cl_mem SSDLayer::forward(
         }
     }
     
-    // Update state->state1 with next_conv_state
-    cl_mem next_conv_state = clCreateBuffer(context, CL_MEM_READ_WRITE, conv_state_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create next_conv_state buffer");
+    // Update state->state1 with next_conv_state (zero-initialized for determinism)
+    cl_mem next_conv_state = createAndZeroBuffer(context, queue, conv_state_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !next_conv_state) throw std::runtime_error("Failed to create next_conv_state buffer");
     clEnqueueWriteBuffer(queue, next_conv_state, CL_TRUE, 0, 
                         conv_state_size * sizeof(float), next_conv_state_cpu.data(), 0, nullptr, nullptr);
     
@@ -1199,14 +1395,15 @@ cl_mem SSDLayer::forward(
     size_t B_size = batch_size * seq_len * d_state_ * n_groups_;
     size_t C_size = batch_size * seq_len * d_state_ * n_groups_;
     
-    cl_mem x_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, x_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create x buffer");
+    // Zero-initialize all intermediate buffers for determinism
+    cl_mem x_buf = createAndZeroBuffer(context, queue, x_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !x_buf) throw std::runtime_error("Failed to create x buffer");
     
-    cl_mem B_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, B_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create B buffer");
+    cl_mem B_buf = createAndZeroBuffer(context, queue, B_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !B_buf) throw std::runtime_error("Failed to create B buffer");
     
-    cl_mem C_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, C_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create C buffer");
+    cl_mem C_buf = createAndZeroBuffer(context, queue, C_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !C_buf) throw std::runtime_error("Failed to create C buffer");
     
     // Split: MLX splits at [d_inner, d_inner + d_state*n_groups]
     // So: x = first d_inner, B = next d_state*n_groups, C = remaining d_state*n_groups
@@ -1488,21 +1685,21 @@ cl_mem SSDLayer::forward(
                                              n_heads_ * sizeof(float), A_actual_gpu.data(), &err);
         if (err != CL_SUCCESS) throw std::runtime_error("Failed to create A_actual buffer");
         
-        // Allocate GPU buffers for intermediate results
-        dt_processed_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, dt_processed_size * sizeof(float), nullptr, &err);
-        if (err != CL_SUCCESS) throw std::runtime_error("Failed to create dt_processed buffer");
+        // Allocate GPU buffers for intermediate results (zero-initialized for determinism)
+        dt_processed_buf = createAndZeroBuffer(context, queue, dt_processed_size * sizeof(float), &err);
+        if (err != CL_SUCCESS || !dt_processed_buf) throw std::runtime_error("Failed to create dt_processed buffer");
         
-        dtA_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, dtA_size * sizeof(float), nullptr, &err);
-        if (err != CL_SUCCESS) throw std::runtime_error("Failed to create dtA buffer");
+        dtA_buf = createAndZeroBuffer(context, queue, dtA_size * sizeof(float), &err);
+        if (err != CL_SUCCESS || !dtA_buf) throw std::runtime_error("Failed to create dtA buffer");
         
-        decay_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, decay_size * sizeof(float), nullptr, &err);
-        if (err != CL_SUCCESS) throw std::runtime_error("Failed to create decay buffer");
+        decay_buf = createAndZeroBuffer(context, queue, decay_size * sizeof(float), &err);
+        if (err != CL_SUCCESS || !decay_buf) throw std::runtime_error("Failed to create decay buffer");
         
-        CB_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, CB_size * sizeof(float), nullptr, &err);
-        if (err != CL_SUCCESS) throw std::runtime_error("Failed to create CB buffer");
+        CB_buf = createAndZeroBuffer(context, queue, CB_size * sizeof(float), &err);
+        if (err != CL_SUCCESS || !CB_buf) throw std::runtime_error("Failed to create CB buffer");
         
-        dtx_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, dtx_size * sizeof(float), nullptr, &err);
-        if (err != CL_SUCCESS) throw std::runtime_error("Failed to create dtx buffer");
+        dtx_buf = createAndZeroBuffer(context, queue, dtx_size * sizeof(float), &err);
+        if (err != CL_SUCCESS || !dtx_buf) throw std::runtime_error("Failed to create dtx buffer");
         
         err = clSetKernelArg(process_dt_kernel_, 0, sizeof(cl_mem), &dt_buf);
         err |= clSetKernelArg(process_dt_kernel_, 1, sizeof(cl_mem), &dt_bias_);
@@ -1545,12 +1742,11 @@ cl_mem SSDLayer::forward(
         err = clEnqueueNDRangeKernel(queue, compute_segsum_decay_kernel_, 3, nullptr, segsum_global_size, nullptr, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) throw std::runtime_error("Failed to enqueue compute_segsum_decay kernel");
         
-        // Kernel 4: Compute CB = C @ B
-        size_t CB_global_size[4] = {
+        // Kernel 4: Compute CB = C @ B (using 3D work group - OpenCL max is 3D)
+        size_t CB_global_size[3] = {
             static_cast<size_t>(batch_size), 
             static_cast<size_t>(seq_len), 
-            static_cast<size_t>(seq_len), 
-            static_cast<size_t>(n_groups_)
+            static_cast<size_t>(seq_len)
         };
         err = clSetKernelArg(compute_CB_kernel_, 0, sizeof(cl_mem), &B_buf);
         err |= clSetKernelArg(compute_CB_kernel_, 1, sizeof(cl_mem), &C_buf);
@@ -1561,7 +1757,7 @@ cl_mem SSDLayer::forward(
         err |= clSetKernelArg(compute_CB_kernel_, 6, sizeof(int), &d_state_);
         if (err != CL_SUCCESS) throw std::runtime_error("Failed to set compute_CB kernel arguments");
         
-        err = clEnqueueNDRangeKernel(queue, compute_CB_kernel_, 4, nullptr, CB_global_size, nullptr, 0, nullptr, nullptr);
+        err = clEnqueueNDRangeKernel(queue, compute_CB_kernel_, 3, nullptr, CB_global_size, nullptr, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) throw std::runtime_error("Failed to enqueue compute_CB kernel");
         
         // Compute dtx = dt * x (element-wise multiplication)
@@ -1588,15 +1784,15 @@ cl_mem SSDLayer::forward(
         clEnqueueWriteBuffer(queue, dtx_buf, CL_TRUE, 0, dtx_size * sizeof(float), dtx_cpu.data(), 0, nullptr, nullptr);
         
         // Kernel 5: Compute final output y = tril(CB * decay) @ dtx + D * x
-        // Create a separate output buffer for the SSM result
-        cl_mem x_ssm_output_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, x_size * sizeof(float), nullptr, &err);
-        if (err != CL_SUCCESS) throw std::runtime_error("Failed to create x_ssm_output buffer");
+        // Create a separate output buffer for the SSM result (zero-initialized for determinism)
+        cl_mem x_ssm_output_buf = createAndZeroBuffer(context, queue, x_size * sizeof(float), &err);
+        if (err != CL_SUCCESS || !x_ssm_output_buf) throw std::runtime_error("Failed to create x_ssm_output buffer");
         
-        size_t output_global_size[4] = {
+        // Use 3D work group (OpenCL max is 3D) - loop over d_head inside kernel
+        size_t output_global_size[3] = {
             static_cast<size_t>(batch_size), 
             static_cast<size_t>(seq_len), 
-            static_cast<size_t>(n_heads_), 
-            static_cast<size_t>(d_head_)
+            static_cast<size_t>(n_heads_)
         };
         err = clSetKernelArg(compute_ssm_output_kernel_, 0, sizeof(cl_mem), &CB_buf);
         err |= clSetKernelArg(compute_ssm_output_kernel_, 1, sizeof(cl_mem), &decay_buf);
@@ -1612,7 +1808,7 @@ cl_mem SSDLayer::forward(
         err |= clSetKernelArg(compute_ssm_output_kernel_, 11, sizeof(int), &d_state_);
         if (err != CL_SUCCESS) throw std::runtime_error("Failed to set compute_ssm_output kernel arguments");
         
-        err = clEnqueueNDRangeKernel(queue, compute_ssm_output_kernel_, 4, nullptr, output_global_size, nullptr, 0, nullptr, nullptr);
+        err = clEnqueueNDRangeKernel(queue, compute_ssm_output_kernel_, 3, nullptr, output_global_size, nullptr, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) throw std::runtime_error("Failed to enqueue compute_ssm_output kernel");
         
         clFinish(queue);
@@ -1640,9 +1836,9 @@ cl_mem SSDLayer::forward(
         buildKernels();
     }
     
-    // Create output buffer for gated result
-    cl_mem gated_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, x_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create gated buffer");
+    // Create output buffer for gated result (zero-initialized for determinism)
+    cl_mem gated_buf = createAndZeroBuffer(context, queue, x_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !gated_buf) throw std::runtime_error("Failed to create gated buffer");
     
     // Try GPU kernel first, fall back to CPU if not available
     bool gpu_success = false;
@@ -1724,27 +1920,23 @@ cl_mem SSDLayer::step(
     
     // If state buffers are null, initialize them
     if (state->is_null()) {
-        // Initialize conv_state and ssm_state to zeros
+        // Initialize conv_state and ssm_state to zeros (CRITICAL for determinism)
         size_t conv_state_size = batch_size * conv_dim_ * (kernel_size_ - 1);
         size_t ssm_state_size = batch_size * n_heads_ * d_head_ * d_state_;
         
         cl_context context = ctx_->getContext();
         cl_int err;
         
-        // Initialize conv_state
-        state->state1 = clCreateBuffer(context, CL_MEM_READ_WRITE, conv_state_size * sizeof(float), nullptr, &err);
-        if (err != CL_SUCCESS) throw std::runtime_error("Failed to create conv_state buffer");
-        std::vector<float> zeros_conv(conv_state_size, 0.0f);
-        clEnqueueWriteBuffer(queue, state->state1, CL_TRUE, 0, conv_state_size * sizeof(float), zeros_conv.data(), 0, nullptr, nullptr);
+        // Initialize conv_state using createAndZeroBuffer for determinism
+        state->state1 = createAndZeroBuffer(context, queue, conv_state_size * sizeof(float), &err);
+        if (err != CL_SUCCESS || !state->state1) throw std::runtime_error("Failed to create conv_state buffer");
         
-        // Initialize ssm_state
-        state->state2 = clCreateBuffer(context, CL_MEM_READ_WRITE, ssm_state_size * sizeof(float), nullptr, &err);
-        if (err != CL_SUCCESS) {
+        // Initialize ssm_state using createAndZeroBuffer for determinism
+        state->state2 = createAndZeroBuffer(context, queue, ssm_state_size * sizeof(float), &err);
+        if (err != CL_SUCCESS || !state->state2) {
             clReleaseMemObject(state->state1);
             throw std::runtime_error("Failed to create ssm_state buffer");
         }
-        std::vector<float> zeros_ssm(ssm_state_size, 0.0f);
-        clEnqueueWriteBuffer(queue, state->state2, CL_TRUE, 0, ssm_state_size * sizeof(float), zeros_ssm.data(), 0, nullptr, nullptr);
         clFinish(queue);
     }
     
@@ -1781,17 +1973,16 @@ cl_mem SSDLayer::step(
     size_t conv_state_size = batch_size * conv_dim_ * (kernel_size_ - 1);
     cl_mem conv_state = state->state1;
     if (conv_state == nullptr) {
-        // Initialize conv_state to zeros
-        conv_state = clCreateBuffer(context, CL_MEM_READ_WRITE, conv_state_size * sizeof(float), nullptr, &err);
-        if (err != CL_SUCCESS) throw std::runtime_error("Failed to create conv_state buffer");
-        std::vector<float> zeros(conv_state_size, 0.0f);
-        clEnqueueWriteBuffer(queue, conv_state, CL_TRUE, 0, conv_state_size * sizeof(float), zeros.data(), 0, nullptr, nullptr);
+        // Initialize conv_state to zeros (CRITICAL for determinism)
+        conv_state = createAndZeroBuffer(context, queue, conv_state_size * sizeof(float), &err);
+        if (err != CL_SUCCESS || !conv_state) throw std::runtime_error("Failed to create conv_state buffer");
     }
     
-    cl_mem conv_output = clCreateBuffer(context, CL_MEM_READ_WRITE, xBC_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create conv_output buffer");
-    cl_mem next_conv_state = clCreateBuffer(context, CL_MEM_READ_WRITE, conv_state_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create next_conv_state buffer");
+    // Zero-initialize intermediate buffers for determinism
+    cl_mem conv_output = createAndZeroBuffer(context, queue, xBC_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !conv_output) throw std::runtime_error("Failed to create conv_output buffer");
+    cl_mem next_conv_state = createAndZeroBuffer(context, queue, conv_state_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !next_conv_state) throw std::runtime_error("Failed to create next_conv_state buffer");
     
     // Set kernel arguments for conv1d_update
     err = clSetKernelArg(conv_update_kernel_, 0, sizeof(cl_mem), &xBC_buf);
@@ -1927,11 +2118,9 @@ cl_mem SSDLayer::step(
     size_t ssm_state_size = batch_size * n_heads_ * d_head_ * d_state_;
     cl_mem ssm_state = state->state2;
     if (ssm_state == nullptr) {
-        // Initialize ssm_state to zeros
-        ssm_state = clCreateBuffer(context, CL_MEM_READ_WRITE, ssm_state_size * sizeof(float), nullptr, &err);
-        if (err != CL_SUCCESS) throw std::runtime_error("Failed to create ssm_state buffer");
-        std::vector<float> zeros(ssm_state_size, 0.0f);
-        clEnqueueWriteBuffer(queue, ssm_state, CL_TRUE, 0, ssm_state_size * sizeof(float), zeros.data(), 0, nullptr, nullptr);
+        // Initialize ssm_state to zeros (CRITICAL for determinism)
+        ssm_state = createAndZeroBuffer(context, queue, ssm_state_size * sizeof(float), &err);
+        if (err != CL_SUCCESS || !ssm_state) throw std::runtime_error("Failed to create ssm_state buffer");
     }
     
     // Read ssm_state to CPU
@@ -1984,9 +2173,9 @@ cl_mem SSDLayer::step(
         }
     }
     
-    // Write updated ssm_state back
-    cl_mem next_ssm_state = clCreateBuffer(context, CL_MEM_READ_WRITE, ssm_state_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create next_ssm_state buffer");
+    // Write updated ssm_state back (zero-initialized for determinism)
+    cl_mem next_ssm_state = createAndZeroBuffer(context, queue, ssm_state_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !next_ssm_state) throw std::runtime_error("Failed to create next_ssm_state buffer");
     clEnqueueWriteBuffer(queue, next_ssm_state, CL_TRUE, 0, ssm_state_size * sizeof(float), ssm_state_cpu.data(), 0, nullptr, nullptr);
     
     // Update state->state2
@@ -1996,9 +2185,9 @@ cl_mem SSDLayer::step(
     state->state2 = next_ssm_state;
     if (ssm_state != state->state2) clReleaseMemObject(ssm_state);
     
-    // Write x_ssm to GPU
-    cl_mem x_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, x_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create x buffer");
+    // Write x_ssm to GPU (zero-initialized for determinism)
+    cl_mem x_buf = createAndZeroBuffer(context, queue, x_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !x_buf) throw std::runtime_error("Failed to create x buffer");
     clEnqueueWriteBuffer(queue, x_buf, CL_TRUE, 0, x_size * sizeof(float), x_ssm_cpu.data(), 0, nullptr, nullptr);
     clFinish(queue);
     
@@ -2008,9 +2197,9 @@ cl_mem SSDLayer::step(
         buildKernels();
     }
     
-    // Create output buffer for gated result
-    cl_mem gated_buf = clCreateBuffer(context, CL_MEM_READ_WRITE, x_size * sizeof(float), nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("Failed to create gated buffer");
+    // Create output buffer for gated result (zero-initialized for determinism)
+    cl_mem gated_buf = createAndZeroBuffer(context, queue, x_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !gated_buf) throw std::runtime_error("Failed to create gated buffer");
     
     // Try GPU kernel first, fall back to CPU if not available
     bool gpu_success = false;
