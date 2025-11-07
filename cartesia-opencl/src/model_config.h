@@ -43,8 +43,8 @@ constexpr int SSD_N_GROUPS = 1;         // Number of groups
 constexpr int ATTENTION_N_HEADS = 8;    // Reduced from 16 (1024/128=8)
 constexpr int ATTENTION_HEAD_DIM = 128;  // Head dimension
 
-// RMS Norm epsilon
-constexpr float RMS_NORM_EPS = 1e-6f;
+// RMS Norm epsilon (must match MLX default)
+constexpr float RMS_NORM_EPS = 1e-5f;
 
 // Sampling defaults
 constexpr float DEFAULT_TEMPERATURE = 0.85f;

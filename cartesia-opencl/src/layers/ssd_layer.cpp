@@ -287,9 +287,9 @@ __kernel void conv1d_update_kernel(
 // Helper kernels for SSD layer operations
 
 // Kernel to split in_proj output into z, xBC, dt
-// in_proj: [batch_size, seq_len, in_proj_dim] where in_proj_dim = d_inner + 2*d_inner + 2*d_state*n_groups + n_heads
+// in_proj: [batch_size, seq_len, in_proj_dim] where in_proj_dim = d_inner + (d_inner + 2*d_state*n_groups) + n_heads
 // z: [batch_size, seq_len, d_inner]
-// xBC: [batch_size, seq_len, 2*d_inner + 2*d_state*n_groups]
+// xBC: [batch_size, seq_len, d_inner + 2*d_state*n_groups]  // FIXED: was 2*d_inner
 // dt: [batch_size, seq_len, n_heads]
 __kernel void split_in_proj_kernel(
     __global const float* in_proj,
@@ -299,7 +299,7 @@ __kernel void split_in_proj_kernel(
     const int batch_size,
     const int seq_len,
     const int d_inner,
-    const int xBC_dim,  // 2*d_inner + 2*d_state*n_groups
+    const int xBC_dim,  // FIXED: d_inner + 2*d_state*n_groups (was 2*d_inner)
     const int n_heads,
     const int in_proj_dim
 ) {
@@ -1088,7 +1088,7 @@ void SSDLayer::splitInProjOutput(
             throw std::runtime_error("Output buffers not allocated");
         }
         
-        int xBC_dim = 2 * d_inner_ + 2 * d_state_ * n_groups_;
+        int xBC_dim = d_inner_ + 2 * d_state_ * n_groups_;  // FIXED: was 2*d_inner_
         
         cl_int err;
         err = clSetKernelArg(split_in_proj_kernel_, 0, sizeof(cl_mem), &in_proj_output);
@@ -1119,7 +1119,7 @@ void SSDLayer::splitInProjOutput(
                        total_size * sizeof(float), in_proj_cpu.data(), 0, nullptr, nullptr);
     
     std::vector<float> z_cpu(batch_size * seq_len * d_inner_);
-    std::vector<float> xBC_cpu(batch_size * seq_len * (2 * d_inner_ + 2 * d_state_ * n_groups_));
+    std::vector<float> xBC_cpu(batch_size * seq_len * (d_inner_ + 2 * d_state_ * n_groups_));  // FIXED: was 2*d_inner_
     std::vector<float> dt_cpu(batch_size * seq_len * n_heads_);
     
     for (int b = 0; b < batch_size; ++b) {
@@ -1131,12 +1131,13 @@ void SSDLayer::splitInProjOutput(
             }
             
             int xBC_start = base_idx + d_inner_;
-            for (int i = 0; i < 2 * d_inner_ + 2 * d_state_ * n_groups_; ++i) {
-                xBC_cpu[(b * seq_len + s) * (2 * d_inner_ + 2 * d_state_ * n_groups_) + i] = 
+            int xBC_dim = d_inner_ + 2 * d_state_ * n_groups_;  // FIXED: was 2*d_inner_
+            for (int i = 0; i < xBC_dim; ++i) {
+                xBC_cpu[(b * seq_len + s) * xBC_dim + i] = 
                     in_proj_cpu[xBC_start + i];
             }
             
-            int dt_start = base_idx + d_inner_ + 2 * d_inner_ + 2 * d_state_ * n_groups_;
+            int dt_start = base_idx + d_inner_ + xBC_dim;
             for (int i = 0; i < n_heads_; ++i) {
                 dt_cpu[(b * seq_len + s) * n_heads_ + i] = in_proj_cpu[dt_start + i];
             }
@@ -1173,8 +1174,9 @@ cl_mem SSDLayer::forward(
     
     // Step 2: Split into z, xBC, dt
     // Allocate buffers for z, xBC, dt (zero-initialized for determinism)
+    // FIXED: xBC should be d_inner (NOT 2*d_inner) + 2*d_state*n_groups
     size_t z_size = batch_size * seq_len * d_inner_;
-    size_t xBC_size = batch_size * seq_len * (2 * d_inner_ + 2 * d_state_ * n_groups_);
+    size_t xBC_size = batch_size * seq_len * (d_inner_ + 2 * d_state_ * n_groups_);  // FIXED: was 2*d_inner_
     size_t dt_size = batch_size * seq_len * n_heads_;
     
     cl_mem z_buf = createAndZeroBuffer(context, queue, z_size * sizeof(float), &err);
@@ -1192,9 +1194,9 @@ cl_mem SSDLayer::forward(
     
     // Debug: Check xBC after split (before conv1d)
     // Step 3: conv1d on xBC with Swish activation using GPU kernel
-    // xBC is [batch, seq_len, xBC_channels] where xBC_channels = 2*d_inner + 2*d_state*n_groups
-    // BUT: MLX conv1d processes only the first conv_dim channels (d_inner + 2*d_state*n_groups)
-    // The remaining channels pass through unchanged
+    // xBC is [batch, seq_len, xBC_channels] where xBC_channels = d_inner + 2*d_state*n_groups
+    // (NOTE: xBC_channels was incorrectly 2*d_inner before - now fixed!)
+    // conv1d processes conv_dim channels (d_inner + 2*d_state*n_groups), then we split to get x,B,C
     
     // CRITICAL: Match Metal implementation - concatenate state before conv, then drop last k-1 elements
     // Metal: x = concatenate([state, x], axis=-1), then y = y[..., : -kernel_size + 1]
@@ -1208,7 +1210,7 @@ cl_mem SSDLayer::forward(
         throw std::runtime_error("conv_forward_kernel not available");
     }
     
-    int xBC_channels = 2 * d_inner_ + 2 * d_state_ * n_groups_;
+    int xBC_channels = d_inner_ + 2 * d_state_ * n_groups_;  // FIXED: was 2*d_inner_
     
     // Get or initialize conv_state from state->state1
     // conv_state shape: [batch_size, conv_dim, kernel_size - 1]
@@ -1407,7 +1409,7 @@ cl_mem SSDLayer::forward(
     
     // Split: MLX splits at [d_inner, d_inner + d_state*n_groups]
     // So: x = first d_inner, B = next d_state*n_groups, C = remaining d_state*n_groups
-    // Note: xBC_conv_read has xBC_channels = 2*d_inner + 2*d_state*n_groups channels
+    // Note: xBC_conv_read has xBC_channels = d_inner + 2*d_state*n_groups channels (FIXED)
     std::vector<float> x_cpu(x_size);
     std::vector<float> B_cpu(B_size);
     std::vector<float> C_cpu(C_size);
@@ -1813,7 +1815,77 @@ cl_mem SSDLayer::forward(
         
         clFinish(queue);
         
-        // Copy SSM output to x_buf for subsequent steps
+        // BEFORE overwriting x_buf: Extract SSM state for next step() call (MUST be before copy!)
+        // We need to read x_buf while it still contains the SSM INPUT, not output
+        // SSM state = sum_t[(dtx[t] * decay[t]) @ B[t]], accumulated over ALL sequence positions
+        // State shape: [batch_size, n_heads, d_head, d_state]
+        if (state != nullptr) {
+            size_t ssm_state_size = batch_size * n_heads_ * d_head_ * d_state_;
+            std::vector<float> ssm_state_cpu(ssm_state_size, 0.0f);  // Initialize to zero for accumulation
+            
+            // Read ALL x, B, dt values (not just last position)
+            std::vector<float> x_all(x_size);
+            std::vector<float> B_all(B_size);
+            std::vector<float> dt_all(batch_size * seq_len * n_heads_);
+            
+            clEnqueueReadBuffer(queue, x_buf, CL_TRUE, 0, x_all.size() * sizeof(float), x_all.data(), 0, nullptr, nullptr);
+            clEnqueueReadBuffer(queue, B_buf, CL_TRUE, 0, B_all.size() * sizeof(float), B_all.data(), 0, nullptr, nullptr);
+            clEnqueueReadBuffer(queue, dt_processed_buf, CL_TRUE, 0, dt_all.size() * sizeof(float), dt_all.data(), 0, nullptr, nullptr);
+            
+            // Read A
+            std::vector<float> A_cpu(n_heads_);
+            clEnqueueReadBuffer(queue, A_, CL_TRUE, 0, n_heads_ * sizeof(float), A_cpu.data(), 0, nullptr, nullptr);
+            
+            // Accumulate SSM state across ALL sequence positions
+            for (int b = 0; b < batch_size; ++b) {
+                for (int h = 0; h < n_heads_; ++h) {
+                    float A_val = A_cpu[h];
+                    int group_idx = h % n_groups_;
+                    
+                    // For each sequence position, compute cumulative decay and accumulate contribution
+                    for (int t = 0; t < seq_len; ++t) {
+                        // FIXED: Compute decay from position t+1 to END: exp(A * sum(dt[t+1:seq_len]))
+                        float dt_cumsum_after = 0.0f;
+                        for (int s = t + 1; s < seq_len; ++s) {
+                            dt_cumsum_after += dt_all[(b * seq_len + s) * n_heads_ + h];
+                        }
+                        float decay = expf(A_val * dt_cumsum_after);
+                        float dt_val = dt_all[(b * seq_len + t) * n_heads_ + h];
+                        
+                        for (int d = 0; d < d_head_; ++d) {
+                            int x_idx = (b * seq_len + t) * d_inner_ + h * d_head_ + d;
+                            float x_val = x_all[x_idx];
+                            float dtx_decay = dt_val * x_val * decay;
+                            
+                            // Accumulate state contribution: dtx_decay @ B[t]
+                            for (int n = 0; n < d_state_; ++n) {
+                                int B_idx = (b * seq_len + t) * (d_state_ * n_groups_) + group_idx * d_state_ + n;
+                                float B_val = B_all[B_idx];
+                                
+                                int state_idx = (b * n_heads_ + h) * d_head_ * d_state_ + d * d_state_ + n;
+                                ssm_state_cpu[state_idx] += dtx_decay * B_val;  // ACCUMULATE, not replace
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Write SSM state to GPU buffer
+            cl_int err_state;
+            cl_mem next_ssm_state = createAndZeroBuffer(context, queue, ssm_state_size * sizeof(float), &err_state);
+            if (err_state != CL_SUCCESS || !next_ssm_state) throw std::runtime_error("Failed to create next_ssm_state buffer in forward");
+            
+            clEnqueueWriteBuffer(queue, next_ssm_state, CL_TRUE, 0, ssm_state_size * sizeof(float), ssm_state_cpu.data(), 0, nullptr, nullptr);
+            
+            // Update state->state2
+            if (state->state2 != nullptr) {
+                clReleaseMemObject(state->state2);
+            }
+            state->state2 = next_ssm_state;
+            clFinish(queue);
+        }
+        
+        // NOW copy SSM output to x_buf (after extracting state using the original x values)
         err = clEnqueueCopyBuffer(queue, x_ssm_output_buf, x_buf, 0, 0, x_size * sizeof(float), 0, nullptr, nullptr);
         if (err != CL_SUCCESS) throw std::runtime_error("Failed to copy SSM output to x_buf");
         clFinish(queue);
