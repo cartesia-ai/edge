@@ -28,7 +28,6 @@
 
 using namespace cartesia_opencl;
 
-
 // Helper: Read token IDs from binary file
 std::vector<int32_t> readTokenFile(const std::string& filename) {
     std::ifstream file(filename, std::ios::binary);
@@ -773,13 +772,7 @@ int main(int argc, char* argv[]) {
     // Forward through sequence model
     std::cout << "  Step 2: Forward pass through " << seq_model.getNumLayers() << " layers..." << std::flush;
     std::vector<LayerState> states;  // Will be populated by stateful layers
-    // Extract base name from output_file for layer dump naming (match MLX format)
-    std::string output_base = output_file;
-    size_t bin_pos = output_base.find(".bin");
-    if (bin_pos != std::string::npos) {
-        output_base = output_base.substr(0, bin_pos);
-    }
-    cl_mem hidden = seq_model.forward(embeddings, batch_size, seq_len, &states, queue, output_base);
+    cl_mem hidden = seq_model.forward(embeddings, batch_size, seq_len, &states, queue);
     clFinish(queue);  // Ensure forward pass completion for determinism
     std::cout << " ✓" << std::endl;
     
@@ -798,7 +791,6 @@ int main(int argc, char* argv[]) {
     if (err != CL_SUCCESS) {
         throw std::runtime_error("Failed to read last token hidden state");
     }
-    
     
     // Create a buffer for the last token hidden state
     cl_mem last_token_hidden_buf = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
@@ -825,14 +817,6 @@ int main(int argc, char* argv[]) {
     // Release the temporary buffer
     clReleaseMemObject(last_token_hidden_buf);
     
-    DEBUG_LOGITS({
-        std::cout << "  Prefill logits (first 10): ";
-        for (int i = 0; i < 10 && i < ACTUAL_VOCAB_SIZE; ++i) {
-            std::cout << last_token_logits[i] << " ";
-        }
-        std::cout << std::endl;
-    });
-    
     // Sample first token from prefill logits
     std::cout << "  Step 4: Sampling first token from prefill logits..." << std::flush;
     int current_token_id = sampler.topPSample(last_token_logits, DEFAULT_TOP_P, DEFAULT_TEMPERATURE);
@@ -841,19 +825,17 @@ int main(int argc, char* argv[]) {
     // Release prefill logits buffer
     clReleaseMemObject(prefill_logits);
     
-    // Generate tokens
-    std::cout << "Generating " << max_tokens << " tokens..." << std::endl;
+    // Generate tokens (matching MLX: first token + (max_tokens - 1) more)
+    std::cout << "Generating " << (max_tokens - 1) << " more tokens..." << std::endl;
     std::vector<int32_t> generated_tokens;
+    generated_tokens.push_back(current_token_id);  // Include prefill token to match MLX
         
-        for (int i = 0; i < max_tokens; ++i) {
+        for (int i = 0; i < max_tokens - 1; ++i) {
             cl_mem current_token_buf = nullptr;
             cl_mem current_embedding = nullptr;
             cl_mem next_hidden = nullptr;
             cl_mem logits = nullptr;
             try {
-                DEBUG_TOKENS({
-                    std::cout << "  [Gen] Step " << (i+1) << ": token_id=" << current_token_id << std::endl;
-                });
                 // Encode current token
                 std::vector<int32_t> current_token_vec = {current_token_id};
                 current_token_buf = createTokenBuffer(context, current_token_vec);
@@ -861,7 +843,7 @@ int main(int argc, char* argv[]) {
                 if (!current_embedding) throw std::runtime_error("encodeStep returned null buffer");
                 
                 // Step through sequence model
-                next_hidden = seq_model.step(current_embedding, batch_size, &states, queue, "");
+                next_hidden = seq_model.step(current_embedding, batch_size, &states, queue);
                 if (!next_hidden) throw std::runtime_error("seq_model.step returned null buffer");
                 
                 // Get logits from LM head
@@ -871,29 +853,11 @@ int main(int argc, char* argv[]) {
                 // Ensure all writes are visible before CPU read in sampler
                 clFinish(queue);
                 
-                // Read logits for dumping
-                std::vector<float> gen_logits(ACTUAL_VOCAB_SIZE);
-                cl_int read_err = clEnqueueReadBuffer(queue, logits, CL_TRUE, 0,
-                    ACTUAL_VOCAB_SIZE * sizeof(float), gen_logits.data(), 0, nullptr, nullptr);
-                
-                DEBUG_LOGITS({
-                    if (read_err == CL_SUCCESS) {
-                        std::cout << "  Gen step " << i << " logits (first 10): ";
-                        for (int j = 0; j < 10 && j < ACTUAL_VOCAB_SIZE; ++j) {
-                            std::cout << gen_logits[j] << " ";
-                        }
-                        std::cout << std::endl;
-                    }
-                });
-                
                 // Sample next token
                 int next_token = sampler.sampleFromBuffer(
                     logits, ACTUAL_VOCAB_SIZE, queue,
                     DEFAULT_TOP_P, DEFAULT_TEMPERATURE
                 );
-                DEBUG_TOKENS({
-                    std::cout << "  Sampled token=" << next_token << std::endl;
-                });
                 
                 // Clamp token ID to valid range
                 if (next_token >= ACTUAL_VOCAB_SIZE) {
