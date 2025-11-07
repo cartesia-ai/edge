@@ -762,23 +762,17 @@ int main(int argc, char* argv[]) {
         int seq_len = prompt_tokens.size();
         
         // Prefill: Process prompt tokens
-        std::cout << "Running prefill on " << seq_len << " tokens..." << std::endl;
-        std::cout << "  Step 1: Encoding tokens..." << std::flush;
         cl_mem embeddings = embedding.encode(token_buffer, batch_size, seq_len, queue);
         clFinish(queue);  // Ensure embedding completion for determinism
-        std::cout << " ✓" << std::endl;
         
         
     // Forward through sequence model
-    std::cout << "  Step 2: Forward pass through " << seq_model.getNumLayers() << " layers..." << std::flush;
     std::vector<LayerState> states;  // Will be populated by stateful layers
     cl_mem hidden = seq_model.forward(embeddings, batch_size, seq_len, &states, queue);
     clFinish(queue);  // Ensure forward pass completion for determinism
-    std::cout << " ✓" << std::endl;
     
     
-    // Step 3: Get logits from last token and sample first generation token
-    std::cout << "  Step 3: Computing logits from last token..." << std::flush;
+    // Get logits from last token and sample first generation token
     // Match MLX: extract last token first, then apply LM head
     // hidden is [batch_size, seq_len, d_model] = [1, seq_len, d_model]
     // Extract last token: [batch_size, d_model] = [1, d_model]
@@ -803,7 +797,6 @@ int main(int argc, char* argv[]) {
     // Apply LM head to last token only (batch_size=1)
     cl_mem prefill_logits = lm_head.forward(last_token_hidden_buf, batch_size, queue);
     clFinish(queue);  // Ensure LM head completion for determinism
-    std::cout << " ✓" << std::endl;
     
     // Read logits for the last token
     std::vector<float> last_token_logits(ACTUAL_VOCAB_SIZE);
@@ -818,17 +811,20 @@ int main(int argc, char* argv[]) {
     clReleaseMemObject(last_token_hidden_buf);
     
     // Sample first token from prefill logits
-    std::cout << "  Step 4: Sampling first token from prefill logits..." << std::flush;
     int current_token_id = sampler.topPSample(last_token_logits, DEFAULT_TOP_P, DEFAULT_TEMPERATURE);
-    std::cout << " ✓ (token=" << current_token_id << ")" << std::endl;
     
     // Release prefill logits buffer
     clReleaseMemObject(prefill_logits);
     
     // Generate tokens (matching MLX: first token + (max_tokens - 1) more)
-    std::cout << "Generating " << (max_tokens - 1) << " more tokens..." << std::endl;
     std::vector<int32_t> generated_tokens;
     generated_tokens.push_back(current_token_id);  // Include prefill token to match MLX
+    
+    // Print first token (decoded)
+    if (tokenizer_loaded) {
+        std::string decoded_token = tokenizer.decode({current_token_id});
+        std::cout << decoded_token << std::flush;
+    }
         
         for (int i = 0; i < max_tokens - 1; ++i) {
             cl_mem current_token_buf = nullptr;
@@ -867,9 +863,14 @@ int main(int argc, char* argv[]) {
                 generated_tokens.push_back(next_token);
                 current_token_id = next_token;
                 
+                // Print decoded token
+                if (tokenizer_loaded) {
+                    std::string decoded_token = tokenizer.decode({next_token});
+                    std::cout << decoded_token << std::flush;
+                }
+                
                 // Check for EOS
                 if (next_token == EOS_TOKEN_ID) {
-                    std::cout << "Generated EOS token, stopping generation" << std::endl;
                     // Cleanup temporary buffers
                     if (current_token_buf) clReleaseMemObject(current_token_buf);
                     if (current_embedding) clReleaseMemObject(current_embedding);
@@ -883,10 +884,6 @@ int main(int argc, char* argv[]) {
                 if (current_embedding) { clReleaseMemObject(current_embedding); current_embedding = nullptr; }
                 if (next_hidden) { clReleaseMemObject(next_hidden); next_hidden = nullptr; }
                 if (logits) { clReleaseMemObject(logits); logits = nullptr; }
-                
-                if ((i + 1) % 10 == 0) {
-                    std::cout << "Generated " << (i + 1) << " tokens..." << std::endl;
-                }
             } catch (const std::exception& e) {
                 std::cerr << "Error during generation step " << (i + 1) << ": " << e.what() << std::endl;
                 // Ensure we free any allocated buffers on error to avoid driver crashes
@@ -899,11 +896,8 @@ int main(int argc, char* argv[]) {
         }
         
         std::cout << std::endl;
-        std::cout << "Generation loop completed!" << std::endl;
         
         // Cleanup - protect against double-release and invalid buffers
-        std::cout << "Cleaning up prefill buffers..." << std::flush;
-        
         // NOTE: embeddings and hidden are owned by their respective layers (EmbeddingLayer and SequenceModel)
         // They will be released when the layers are destroyed, so we should NOT release them here.
         // Only release token_buffer which we created directly.
@@ -911,44 +905,26 @@ int main(int argc, char* argv[]) {
         // Helper function to safely release a buffer (avoiding clGetMemObjectInfo which can crash)
         auto safeRelease = [](cl_mem buf, const char* name) -> bool {
             if (!buf) {
-                std::cout << "\n  Skipping " << name << " (already null)" << std::flush;
                 return true;
             }
             try {
-                std::cout << "\n  Releasing " << name << "..." << std::flush;
                 cl_int release_err = clReleaseMemObject(buf);
-                if (release_err == CL_SUCCESS) {
-                    std::cout << " ✓" << std::flush;
-                    return true;
-                } else if (release_err == CL_INVALID_MEM_OBJECT) {
-                    std::cout << " (already invalid)" << std::flush;
+                if (release_err == CL_SUCCESS || release_err == CL_INVALID_MEM_OBJECT) {
                     return true;
                 } else {
-                    std::cerr << "\nWarning: Failed to release " << name << " buffer (err=" << release_err << ")" << std::endl;
                     return false;
                 }
             } catch (...) {
-                std::cerr << "\nException releasing " << name << std::endl;
                 return false;
             }
         };
         
         // Only release token_buffer - embeddings and hidden are owned by their layers
-        bool success = true;
-        success &= safeRelease(token_buffer, "token_buffer");
+        safeRelease(token_buffer, "token_buffer");
         token_buffer = nullptr;
         // embeddings and hidden will be cleaned up by their layer destructors
         embeddings = nullptr;  // Just set to null, don't release
         hidden = nullptr;       // Just set to null, don't release
-        
-        if (success) {
-            std::cout << "\n  Prefill buffers cleaned up (embeddings and hidden owned by layers)" << std::endl;
-        } else {
-            std::cout << "\n  Some buffers had issues during release" << std::endl;
-        }
-        
-        std::cout << std::endl;
-        std::cout << "Generation complete!" << std::endl;
         DEBUG_TOKENS({
             std::cout << "Generated " << generated_tokens.size() << " tokens: [";
             for (size_t i = 0; i < generated_tokens.size(); ++i) {
@@ -960,35 +936,11 @@ int main(int argc, char* argv[]) {
         
         // Write output (even if partially generated)
         if (!generated_tokens.empty()) {
-            std::cout << "Writing output to: " << output_file << std::endl;
             writeTokenFile(output_file, generated_tokens);
-            std::cout << "✓ Output written (" << generated_tokens.size() << " tokens)" << std::endl;
-            
-            // Decode and display generated text if tokenizer is loaded
-            if (tokenizer_loaded) {
-                std::cout << std::endl;
-                std::cout << "========================================" << std::endl;
-                std::cout << "Generated Text:" << std::endl;
-                std::cout << "========================================" << std::endl;
-                std::string decoded_text = tokenizer.decode(generated_tokens);
-                std::cout << decoded_text << std::endl;
-                std::cout << "========================================" << std::endl;
-            } else {
-                std::cout << std::endl;
-                std::cout << "Note: Tokenizer not loaded - text decoding not available" << std::endl;
-                std::cout << "To decode tokens, ensure tokenizer files (vocab.json/merges.txt) are in weights directory" << std::endl;
-            }
-        } else {
-            std::cout << "Warning: No tokens generated, skipping output file write" << std::endl;
         }
         
         // Cleanup OpenCL
         ctx_mgr.cleanup();
-        
-        std::cout << std::endl;
-        std::cout << "========================================" << std::endl;
-        std::cout << "Success!" << std::endl;
-        std::cout << "========================================" << std::endl;
         
         return 0;
     } catch (const std::exception& e) {

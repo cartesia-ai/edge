@@ -918,13 +918,6 @@ __kernel void compute_ssm_output_kernel(
             std::cerr << "[SSD] Failed to build compute_ssm_output kernel (unknown error)" << std::endl;
         }
         
-        if (kernels_built == 5) {
-            std::cout << "[SSD] ✓ All 5 SSM forward kernels built successfully (GPU acceleration enabled)" << std::endl;
-        } else if (kernels_built > 0) {
-            std::cout << "[SSD] ⚠ Partial kernel build: " << kernels_built << "/5 kernels built (hybrid GPU/CPU mode)" << std::endl;
-        } else {
-            std::cout << "[SSD] ⚠ No SSM forward kernels built (CPU fallback mode)" << std::endl;
-        }
     } catch (const std::exception& e) {
         // Clean up what we created - but be very careful about order
         // Release kernels first, then program
