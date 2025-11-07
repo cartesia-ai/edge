@@ -25,6 +25,7 @@
 #include <cmath>
 #include <numeric>
 #include <algorithm>
+#include <chrono>
 
 using namespace cartesia_opencl;
 
@@ -334,6 +335,7 @@ int main(int argc, char* argv[]) {
         
         // Initialize model components
         std::cout << "Initializing model components..." << std::endl;
+        auto weight_load_start = std::chrono::high_resolution_clock::now();
         
         // Embedding layer
         EmbeddingLayer embedding(&ctx_mgr, ACTUAL_VOCAB_SIZE, ACTUAL_D_MODEL);
@@ -749,11 +751,16 @@ int main(int argc, char* argv[]) {
         std::cout << " ✓" << std::endl;
         std::cout << "✓ LM Head initialized (" << (ACTUAL_VOCAB_SIZE * ACTUAL_D_MODEL * sizeof(float) / 1024 / 1024) << " MB)" << std::endl;
         
+        auto weight_load_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> weight_load_elapsed = weight_load_end - weight_load_start;
+        
         // Sampler
         Sampler sampler;
         std::cout << "✓ Sampler initialized" << std::endl;
         
         std::cout << "✓ Model initialization complete" << std::endl;
+        std::cout << "  Weight loading time: " << std::fixed << std::setprecision(3) 
+                  << weight_load_elapsed.count() << " seconds" << std::endl;
         std::cout << std::endl;
         
         // Create token buffer
@@ -762,6 +769,9 @@ int main(int argc, char* argv[]) {
         int seq_len = prompt_tokens.size();
         
         // Prefill: Process prompt tokens
+        std::cout << "Running prefill on " << seq_len << " tokens..." << std::endl;
+        auto prefill_start = std::chrono::high_resolution_clock::now();
+        
         cl_mem embeddings = embedding.encode(token_buffer, batch_size, seq_len, queue);
         clFinish(queue);  // Ensure embedding completion for determinism
         
@@ -813,6 +823,10 @@ int main(int argc, char* argv[]) {
     // Sample first token from prefill logits
     int current_token_id = sampler.topPSample(last_token_logits, DEFAULT_TOP_P, DEFAULT_TEMPERATURE);
     
+    auto prefill_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> prefill_elapsed = prefill_end - prefill_start;
+    double prefill_tokens_per_sec = seq_len / prefill_elapsed.count();
+    
     // Release prefill logits buffer
     clReleaseMemObject(prefill_logits);
     
@@ -825,6 +839,10 @@ int main(int argc, char* argv[]) {
         std::string decoded_token = tokenizer.decode({current_token_id});
         std::cout << decoded_token << std::flush;
     }
+    
+    // Start timing for generation phase
+    auto generation_start = std::chrono::high_resolution_clock::now();
+    int tokens_generated = 0;
         
         for (int i = 0; i < max_tokens - 1; ++i) {
             cl_mem current_token_buf = nullptr;
@@ -862,6 +880,7 @@ int main(int argc, char* argv[]) {
                 
                 generated_tokens.push_back(next_token);
                 current_token_id = next_token;
+                tokens_generated++;
                 
                 // Print decoded token
                 if (tokenizer_loaded) {
@@ -895,7 +914,27 @@ int main(int argc, char* argv[]) {
             }
         }
         
+        auto generation_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> generation_elapsed = generation_end - generation_start;
+        double generation_tokens_per_sec = (tokens_generated > 0) ? (tokens_generated / generation_elapsed.count()) : 0.0;
+        
         std::cout << std::endl;
+        std::cout << std::endl;
+        
+        // Display performance summary
+        std::cout << "--------------------------------------------------" << std::endl;
+        std::cout << "Weight loading time: " 
+                  << std::fixed << std::setprecision(3) << weight_load_elapsed.count() 
+                  << " seconds" << std::endl;
+        std::cout << "Time to first token: " 
+                  << std::fixed << std::setprecision(3) << prefill_elapsed.count() 
+                  << " seconds" << std::endl;
+        std::cout << "Prompt: " << seq_len << " tokens, " 
+                  << std::fixed << std::setprecision(2) << prefill_tokens_per_sec 
+                  << " tokens-per-sec" << std::endl;
+        std::cout << "Generation: " << tokens_generated << " tokens, " 
+                  << std::fixed << std::setprecision(2) << generation_tokens_per_sec 
+                  << " tokens-per-sec" << std::endl;
         
         // Cleanup - protect against double-release and invalid buffers
         // NOTE: embeddings and hidden are owned by their respective layers (EmbeddingLayer and SequenceModel)

@@ -45,6 +45,8 @@ SSDLayer::SSDLayer(
     , conv_forward_kernel_(nullptr)
     , conv_update_kernel_(nullptr)
     , split_in_proj_kernel_(nullptr)
+    , split_xBC_step_kernel_(nullptr)
+    , ssm_step_update_kernel_(nullptr)
     , gate_kernel_(nullptr)
     , copy_channels_kernel_(nullptr)
     , process_dt_kernel_(nullptr)
@@ -112,6 +114,14 @@ SSDLayer::~SSDLayer() {
     if (split_in_proj_kernel_) {
         clReleaseKernel(split_in_proj_kernel_);
         split_in_proj_kernel_ = nullptr;
+    }
+    if (split_xBC_step_kernel_) {
+        clReleaseKernel(split_xBC_step_kernel_);
+        split_xBC_step_kernel_ = nullptr;
+    }
+    if (ssm_step_update_kernel_) {
+        clReleaseKernel(ssm_step_update_kernel_);
+        ssm_step_update_kernel_ = nullptr;
     }
     if (gate_kernel_) {
         clReleaseKernel(gate_kernel_);
@@ -635,6 +645,8 @@ __kernel void compute_ssm_output_kernel(
     conv_forward_kernel_ = nullptr;
     conv_update_kernel_ = nullptr;
     split_in_proj_kernel_ = nullptr;
+    split_xBC_step_kernel_ = nullptr;
+    ssm_step_update_kernel_ = nullptr;
     gate_kernel_ = nullptr;
     copy_channels_kernel_ = nullptr;
     ssm_kernel_ = nullptr;
@@ -668,8 +680,6 @@ __kernel void compute_ssm_output_kernel(
         }
         
         // Build helper kernels separately (split and gate) to avoid PowerVR driver crashes
-        // If building fails, we'll use CPU fallback
-        try {
             std::vector<std::string> helper_sources = {std::string(helper_kernels_source)};
             std::string helper_cache_key = ctx_mgr.generateCacheKey(helper_sources) + "_helper";
             
@@ -677,17 +687,69 @@ __kernel void compute_ssm_output_kernel(
             
             if (helper_program) {
                 split_in_proj_kernel_ = ctx_mgr.getKernel(helper_program, "split_in_proj_kernel");
+            if (!split_in_proj_kernel_) {
+                throw std::runtime_error("Failed to create split_in_proj_kernel");
+            }
+            
                 gate_kernel_ = ctx_mgr.getKernel(helper_program, "gate_kernel");
+            if (!gate_kernel_) {
+                throw std::runtime_error("Failed to create gate_kernel");
+            }
+            
                 copy_channels_kernel_ = ctx_mgr.getKernel(helper_program, "copy_channels_kernel");
+            if (!copy_channels_kernel_) {
+                throw std::runtime_error("Failed to create copy_channels_kernel");
+            }
+            
+            // Build split_xBC_step_kernel separately to avoid PowerVR crashes
+            try {
+                const char* split_xBC_source = R"(
+__kernel void split_xBC_step_kernel(
+    __global const float* xBC,
+    __global float* x,
+    __global float* B,
+    __global float* C,
+    const int batch_size,
+    const int d_inner,
+    const int d_state_groups
+) {
+    const int idx = get_global_id(0);
+    if (idx >= batch_size) return;
+    
+    const int xBC_dim = d_inner + 2 * d_state_groups;
+    const int xBC_base = idx * xBC_dim;
+    const int x_base = idx * d_inner;
+    const int BC_base = idx * d_state_groups;
+    
+    for (int i = 0; i < d_inner; ++i) {
+        x[x_base + i] = xBC[xBC_base + i];
+    }
+    
+    for (int i = 0; i < d_state_groups; ++i) {
+        B[BC_base + i] = xBC[xBC_base + d_inner + i];
+    }
+    
+    for (int i = 0; i < d_state_groups; ++i) {
+        C[BC_base + i] = xBC[xBC_base + d_inner + d_state_groups + i];
+    }
+}
+)";
+                std::vector<std::string> split_sources = {std::string(split_xBC_source)};
+                std::string split_cache_key = ctx_mgr.generateCacheKey(split_sources) + "_split_xBC";
+                cl_program split_program = ctx_mgr.buildProgram(split_sources, split_cache_key);
+                if (split_program) {
+                    split_xBC_step_kernel_ = ctx_mgr.getKernel(split_program, "split_xBC_step_kernel");
+                    clReleaseProgram(split_program);
+                    fprintf(stderr, "[SSD] split_xBC_step_kernel built successfully\n");
+                }
+            } catch (const std::exception& e) {
+                fprintf(stderr, "[SSD] WARNING: Failed to build split_xBC_step_kernel: %s\n", e.what());
+            }
                 
                 // Release helper program (kernels are retained)
                 clReleaseProgram(helper_program);
             } else {
-            }
-        } catch (const std::exception& e) {
-            // Keep kernels as nullptr - functions will check and use CPU fallback
-        } catch (...) {
-            // Keep kernels as nullptr
+            throw std::runtime_error("Failed to build helper kernels program");
         }
         
         // SSM forward kernels (for prefill) - build each kernel separately to avoid PowerVR driver crashes
@@ -918,6 +980,102 @@ __kernel void compute_ssm_output_kernel(
             std::cerr << "[SSD] Failed to build compute_ssm_output kernel (unknown error)" << std::endl;
         }
         
+        fprintf(stderr, "[SSD] SSM forward kernels: %d/5 built successfully\n", kernels_built);
+        
+        // Build SSM step update kernel separately (for token generation)
+        // Build it after SSM forward kernels to avoid PowerVR driver crashes
+        fprintf(stderr, "[SSD] Attempting to build ssm_step_update_kernel...\n");
+        try {
+            fprintf(stderr, "[SSD] Creating kernel source...\n");
+            // Build kernel - testing what causes PowerVR crash
+            // Try without SOFTPLUS macro first
+            const char* ssm_step_update_source = R"(
+__kernel void ssm_step_update_kernel(
+    __global const float* x,
+    __global const float* dt,
+    __global const float* dt_bias,
+    __global const float* A,
+    __global const float* B,
+    __global const float* C,
+    __global const float* D,
+    __global const float* state,
+    __global float* output,
+    __global float* next_state,
+    const int batch_size,
+    const int n_heads,
+    const int d_head,
+    const int d_state,
+    const int n_groups,
+    const int d_inner
+) {
+    const int idx = get_global_id(0);
+    const int total = batch_size * n_heads * d_head;
+    if (idx >= total) return;
+    
+    // Decompose idx into b, h, d
+    const int d = idx % d_head;
+    const int h = (idx / d_head) % n_heads;
+    const int b = idx / (d_head * n_heads);
+    
+    // Process dt: add bias, softplus, clamp
+    // Use log(1.0f + exp()) instead of log1p(exp()) to avoid PowerVR crash
+    float dt_val = dt[b * n_heads + h] + dt_bias[h];
+    float delta;
+    if (dt_val > 20.0f) {
+        delta = dt_val;
+    } else {
+        float exp_val = exp(dt_val);
+        delta = log(1.0f + exp_val);
+    }
+    if (delta < 0.0f) delta = 0.0f;
+    
+    float A_val = A[h];
+    int group_idx = h % n_groups;
+    int x_idx = b * d_inner + h * d_head + d;
+    float x_val = x[x_idx];
+    
+    float output_sum = 0.0f;
+    
+    // Update state and compute output for each state dimension
+    for (int state_i = 0; state_i < d_state; ++state_i) {
+        int state_idx = (b * n_heads + h) * d_head * d_state + d * d_state + state_i;
+        float old_state = state[state_idx];
+        int BC_idx = b * (d_state * n_groups) + group_idx * d_state + state_i;
+        float B_val = B[BC_idx];
+        float C_val = C[BC_idx];
+        // Use exp() directly - this works in other kernels
+        float new_state = old_state * exp(A_val * delta) + B_val * delta * x_val;
+        next_state[state_idx] = new_state;
+        output_sum += new_state * C_val;
+    }
+    
+    output_sum += D[h] * x_val;
+    output[x_idx] = output_sum;
+}
+)";
+            fprintf(stderr, "[SSD] Building ssm_step_update_kernel program...\n");
+            std::vector<std::string> ssm_step_sources = {std::string(ssm_step_update_source)};
+            std::string ssm_step_cache_key = ctx_mgr.generateCacheKey(ssm_step_sources) + "_ssm_step";
+            cl_program ssm_step_program = ctx_mgr.buildProgram(ssm_step_sources, ssm_step_cache_key);
+            fprintf(stderr, "[SSD] Program build returned, checking result...\n");
+            if (ssm_step_program) {
+                ssm_step_update_kernel_ = ctx_mgr.getKernel(ssm_step_program, "ssm_step_update_kernel");
+                if (ssm_step_update_kernel_) {
+                    clReleaseProgram(ssm_step_program);
+                    fprintf(stderr, "[SSD] ssm_step_update_kernel built successfully\n");
+                } else {
+                    clReleaseProgram(ssm_step_program);
+                    fprintf(stderr, "[SSD] WARNING: Failed to get ssm_step_update_kernel from program\n");
+                }
+            } else {
+                fprintf(stderr, "[SSD] WARNING: Failed to build ssm_step_update_kernel program\n");
+            }
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[SSD] WARNING: Failed to build ssm_step_update_kernel: %s\n", e.what());
+        } catch (...) {
+            fprintf(stderr, "[SSD] WARNING: Failed to build ssm_step_update_kernel (unknown error)\n");
+        }
+        
     } catch (const std::exception& e) {
         // Clean up what we created - but be very careful about order
         // Release kernels first, then program
@@ -956,6 +1114,14 @@ __kernel void compute_ssm_output_kernel(
         if (split_in_proj_kernel_) { 
             clReleaseKernel(split_in_proj_kernel_); 
             split_in_proj_kernel_ = nullptr; 
+        }
+        if (split_xBC_step_kernel_) { 
+            clReleaseKernel(split_xBC_step_kernel_); 
+            split_xBC_step_kernel_ = nullptr; 
+        }
+        if (ssm_step_update_kernel_) { 
+            clReleaseKernel(ssm_step_update_kernel_); 
+            ssm_step_update_kernel_ = nullptr; 
         }
         if (conv_update_kernel_) { 
             clReleaseKernel(conv_update_kernel_); 
@@ -1074,14 +1240,16 @@ void SSDLayer::splitInProjOutput(
         buildKernels();
     }
     
-    // Try GPU kernel first, fall back to CPU if not available
-    if (split_in_proj_kernel_) {
-        // Use GPU kernel to split in_proj output
+    // GPU kernel is required
+    if (!split_in_proj_kernel_) {
+        throw std::runtime_error("split_in_proj_kernel not available - GPU kernel required");
+    }
+    
         if (!z_out || !xBC_out || !dt_out) {
             throw std::runtime_error("Output buffers not allocated");
         }
         
-        int xBC_dim = d_inner_ + 2 * d_state_ * n_groups_;  // FIXED: was 2*d_inner_
+    int xBC_dim = d_inner_ + 2 * d_state_ * n_groups_;
         
         cl_int err;
         err = clSetKernelArg(split_in_proj_kernel_, 0, sizeof(cl_mem), &in_proj_output);
@@ -1095,54 +1263,15 @@ void SSDLayer::splitInProjOutput(
         err |= clSetKernelArg(split_in_proj_kernel_, 8, sizeof(int), &n_heads_);
         err |= clSetKernelArg(split_in_proj_kernel_, 9, sizeof(int), &in_proj_dim_);
         
-        if (err == CL_SUCCESS) {
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to set split_in_proj kernel arguments");
+    }
+    
             size_t global_size = static_cast<size_t>(batch_size * seq_len);
             err = clEnqueueNDRangeKernel(queue, split_in_proj_kernel_, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
-            if (err == CL_SUCCESS) {
-                return; // GPU kernel succeeded
-            }
-        }
-        // If GPU kernel failed, fall through to CPU fallback
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to enqueue split_in_proj kernel");
     }
-    
-    // CPU fallback
-    size_t total_size = batch_size * seq_len * in_proj_dim_;
-    std::vector<float> in_proj_cpu(total_size);
-    clEnqueueReadBuffer(queue, in_proj_output, CL_TRUE, 0, 
-                       total_size * sizeof(float), in_proj_cpu.data(), 0, nullptr, nullptr);
-    
-    std::vector<float> z_cpu(batch_size * seq_len * d_inner_);
-    std::vector<float> xBC_cpu(batch_size * seq_len * (d_inner_ + 2 * d_state_ * n_groups_));  // FIXED: was 2*d_inner_
-    std::vector<float> dt_cpu(batch_size * seq_len * n_heads_);
-    
-    for (int b = 0; b < batch_size; ++b) {
-        for (int s = 0; s < seq_len; ++s) {
-            int base_idx = (b * seq_len + s) * in_proj_dim_;
-            
-            for (int i = 0; i < d_inner_; ++i) {
-                z_cpu[(b * seq_len + s) * d_inner_ + i] = in_proj_cpu[base_idx + i];
-            }
-            
-            int xBC_start = base_idx + d_inner_;
-            int xBC_dim = d_inner_ + 2 * d_state_ * n_groups_;  // FIXED: was 2*d_inner_
-            for (int i = 0; i < xBC_dim; ++i) {
-                xBC_cpu[(b * seq_len + s) * xBC_dim + i] = 
-                    in_proj_cpu[xBC_start + i];
-            }
-            
-            int dt_start = base_idx + d_inner_ + xBC_dim;
-            for (int i = 0; i < n_heads_; ++i) {
-                dt_cpu[(b * seq_len + s) * n_heads_ + i] = in_proj_cpu[dt_start + i];
-            }
-        }
-    }
-    
-    clEnqueueWriteBuffer(queue, z_out, CL_TRUE, 0,
-                        z_cpu.size() * sizeof(float), z_cpu.data(), 0, nullptr, nullptr);
-    clEnqueueWriteBuffer(queue, xBC_out, CL_TRUE, 0,
-                        xBC_cpu.size() * sizeof(float), xBC_cpu.data(), 0, nullptr, nullptr);
-    clEnqueueWriteBuffer(queue, dt_out, CL_TRUE, 0,
-                        dt_cpu.size() * sizeof(float), dt_cpu.data(), 0, nullptr, nullptr);
 }
 
 cl_mem SSDLayer::forward(
@@ -1468,203 +1597,19 @@ cl_mem SSDLayer::forward(
             }
             
             buildKernels();
-            
-            // Note: SSM forward kernels may be nullptr if they were skipped (e.g., PowerVR driver bug)
-            // This is OK - forward() will check and use CPU fallback
         } catch (const std::exception& e) {
-            // Don't throw - allow CPU fallback to be used
-            // SSM forward kernels will be nullptr, which is fine
+            throw std::runtime_error("Failed to build kernels: " + std::string(e.what()));
         } catch (...) {
             throw std::runtime_error("OpenCL driver crashed while building kernels");
         }
     }
     
-    // Check if SSM forward kernels are available
-    // If not (e.g., PowerVR driver bug), use CPU fallback
-    static int ssm_call_count = 0;
-    ssm_call_count++;
-    if (!process_dt_kernel_) {
-        // CPU fallback for SSM forward computation (matrix-based, matching MLX)
-        
-        // Read necessary data from GPU
-        std::vector<float> dt_cpu(dt_size);
-        std::vector<float> x_cpu(x_size);
-        std::vector<float> B_cpu(B_size);
-        std::vector<float> C_cpu(C_size);
-        std::vector<float> A_log_cpu(n_heads_);
-        std::vector<float> dt_bias_cpu(n_heads_);
-        std::vector<float> D_cpu(n_heads_);
-        
-        clEnqueueReadBuffer(queue, dt_buf, CL_TRUE, 0, dt_size * sizeof(float), dt_cpu.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(queue, x_buf, CL_TRUE, 0, x_size * sizeof(float), x_cpu.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(queue, B_buf, CL_TRUE, 0, B_size * sizeof(float), B_cpu.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(queue, C_buf, CL_TRUE, 0, C_size * sizeof(float), C_cpu.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(queue, A_, CL_TRUE, 0, n_heads_ * sizeof(float), A_log_cpu.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(queue, dt_bias_, CL_TRUE, 0, n_heads_ * sizeof(float), dt_bias_cpu.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(queue, D_, CL_TRUE, 0, n_heads_ * sizeof(float), D_cpu.data(), 0, nullptr, nullptr);
-        
-        // A is stored as already negative in MLX (not as A_log before negation)
-        // So we use it directly without applying softplus or negation
-        // MLX stores self.A as negative, and uses it directly in decay = exp(dt * A)
-        std::vector<float> A_actual(n_heads_);
-        for (int h = 0; h < n_heads_; ++h) {
-            A_actual[h] = A_log_cpu[h];  // Use A directly - it's already the final negative value
-        }
-        
-        // Process dt: add bias, softplus, clamp
-        std::vector<float> dt_processed(dt_size);
-        const float dt_min = 0.0f;
-        const float dt_max = 1e10f;
-        for (int b = 0; b < batch_size; ++b) {
-            for (int s = 0; s < seq_len; ++s) {
-                for (int h = 0; h < n_heads_; ++h) {
-                    int idx = (b * seq_len + s) * n_heads_ + h;
-                    float dt_val = dt_cpu[idx] + dt_bias_cpu[h];
-                    dt_val = (dt_val > 20.0f) ? dt_val : log1pf(expf(dt_val));  // softplus
-                    if (dt_val < dt_min) dt_val = dt_min;
-                    if (dt_val > dt_max) dt_val = dt_max;
-                    dt_processed[idx] = dt_val;
-                }
-            }
-        }
-        
-        // Compute dtA = dt * A
-        std::vector<float> dtA(dt_size);
-        for (int b = 0; b < batch_size; ++b) {
-            for (int s = 0; s < seq_len; ++s) {
-                for (int h = 0; h < n_heads_; ++h) {
-                    int idx = (b * seq_len + s) * n_heads_ + h;
-                    dtA[idx] = dt_processed[idx] * A_actual[h];
-                }
-            }
-        }
-        
-        // Compute segsum decay matrix: decay[s,t] = exp(sum from k=t+1 to s of dtA[k])
-        // MLX: dtA is (b, h, l) after swapaxes, segsum[b, h, s, t] = sum dtA[b, h, k] for k from t+1 to s
-        // OpenCL: dtA is stored as (b, l, h), so dtA[b, k, h] = dtA[(b * seq_len + k) * n_heads_ + h]
-        // To match MLX, we need dtA[b, h, k], which is dtA[(b * seq_len + k) * n_heads_ + h] = dtA[b, k, h]
-        // So the indexing is correct: dtA[b, k, h] corresponds to MLX's dtA[b, h, k] after swapaxes
-        size_t decay_size = batch_size * n_heads_ * seq_len * seq_len;
-        std::vector<float> decay(decay_size);
-        for (int b = 0; b < batch_size; ++b) {
-            for (int h = 0; h < n_heads_; ++h) {
-                for (int s = 0; s < seq_len; ++s) {
-                    for (int t = 0; t < seq_len; ++t) {
-                        float segsum = 0.0f;
-                        for (int k = t + 1; k <= s; ++k) {
-                            // dtA[b, k, h] = dtA[(b * seq_len + k) * n_heads_ + h]
-                            // This matches MLX's dtA[b, h, k] after swapaxes
-                            int dtA_idx = (b * seq_len + k) * n_heads_ + h;
-                            segsum += dtA[dtA_idx];
-                        }
-                        // decay[b, h, s, t] = decay[(b * n_heads_ + h) * seq_len * seq_len + s * seq_len + t]
-                        int decay_idx = (b * n_heads_ + h) * seq_len * seq_len + s * seq_len + t;
-                        decay[decay_idx] = expf(segsum);
-                    }
-                }
-            }
-        }
-        
-        // Compute CB = C @ B (matrix multiplication per group)
-        // MLX: After swapaxes, C is (b, g, s, state_i) and B is (b, g, state_i, t)
-        // CB[b, g, s, t] = sum over state_i of C[b, g, s, state_i] * B[b, g, state_i, t]
-        // OpenCL stores: C as (b, s, g, state_i), B as (b, t, g, state_i)
-        // For matrix mult: C[b, g, s, state_i] = C[b, s, g, state_i] (same value)
-        //                 B[b, g, state_i, t] = B[b, t, g, state_i] (same value)
-        // CB is stored as CB[b, g, s, t] to match MLX
-        size_t CB_size = batch_size * seq_len * seq_len * n_groups_;
-        std::vector<float> CB(CB_size);
-        for (int b = 0; b < batch_size; ++b) {
-            for (int g = 0; g < n_groups_; ++g) {
-                for (int s = 0; s < seq_len; ++s) {
-                    for (int t = 0; t < seq_len; ++t) {
-                        float sum = 0.0f;
-                        for (int state_i = 0; state_i < d_state_; ++state_i) {
-                            // C[b, g, s, state_i] needed = C[b, s, g, state_i] stored
-                            int C_idx = (b * seq_len + s) * (n_groups_ * d_state_) + g * d_state_ + state_i;
-                            // B[b, g, state_i, t] needed = B stored at (b, g, state_i, t)
-                            // But we store B as (b, t, g, state_i), so B[b, g, state_i, t] = B[b, t, g, state_i]
-                            // Actually, for matrix mult, we need B[b, g, state_i, t] which means:
-                            //   group g, state state_i, position t
-                            // Our B[b, t, g, state_i] means position t, group g, state state_i
-                            // These are the same value! So B_idx is correct
-                            int B_idx = (b * seq_len + t) * (n_groups_ * d_state_) + g * d_state_ + state_i;
-                            sum += C_cpu[C_idx] * B_cpu[B_idx];
-                        }
-                        // CB stored as CB[b, g, s, t] = CB[((b * n_groups_ + g) * seq_len + s) * seq_len + t]
-                        int CB_idx = ((b * n_groups_ + g) * seq_len + s) * seq_len + t;
-                        CB[CB_idx] = sum;
-                    }
-                }
-            }
-        }
-        
-        // Compute dtx = dt * x (element-wise)
-        std::vector<float> dtx(x_size);
-        for (int b = 0; b < batch_size; ++b) {
-            for (int s = 0; s < seq_len; ++s) {
-                for (int h = 0; h < n_heads_; ++h) {
-                    float dt_val = dt_processed[(b * seq_len + s) * n_heads_ + h];
-                    for (int d = 0; d < d_head_; ++d) {
-                        int x_idx = (b * seq_len + s) * d_inner_ + h * d_head_ + d;
-                        dtx[x_idx] = dt_val * x_cpu[x_idx];
-                    }
-                }
-            }
-        }
-        
-        // Compute final output: y = tril(CB * decay) @ dtx + D * x
-        std::vector<float> y_cpu(x_size);
-        for (int b = 0; b < batch_size; ++b) {
-            for (int s = 0; s < seq_len; ++s) {
-                for (int h = 0; h < n_heads_; ++h) {
-                    int group_idx = h % n_groups_;
-                    for (int d = 0; d < d_head_; ++d) {
-                        int x_idx = (b * seq_len + s) * d_inner_ + h * d_head_ + d;
-                        if (x_idx >= x_size) {
-                            continue;
-                        }
-                        float output_sum = 0.0f;
-                        
-                        // tril(CB * decay) @ dtx
-                        for (int t = 0; t <= s; ++t) {
-                            int x_t_idx = (b * seq_len + t) * d_inner_ + h * d_head_ + d;
-                            if (x_t_idx >= dtx.size()) {
-                                continue;
-                            }
-                            float dtx_t = dtx[x_t_idx];
-                            
-                            int decay_idx = (b * n_heads_ + h) * seq_len * seq_len + s * seq_len + t;
-                            if (decay_idx >= decay.size()) {
-                                continue;
-                            }
-                            float decay_st = decay[decay_idx];
-                            
-                            // CB is stored as CB[b, g, s, t] = CB[((b * n_groups_ + g) * seq_len + s) * seq_len + t]
-                            int CB_idx = ((b * n_groups_ + group_idx) * seq_len + s) * seq_len + t;
-                            if (CB_idx >= CB.size()) {
-                                continue;
-                            }
-                            float CB_st = CB[CB_idx];
-                            
-                            output_sum += CB_st * decay_st * dtx_t;
-                        }
-                        
-                        // Add D * x
-                        output_sum += D_cpu[h] * x_cpu[x_idx];
-                        y_cpu[x_idx] = output_sum;
-                    }
-                }
-            }
-        }
-        
-        // Write result back to GPU
-        clEnqueueWriteBuffer(queue, x_buf, CL_TRUE, 0, x_size * sizeof(float), y_cpu.data(), 0, nullptr, nullptr);
-        clFinish(queue);
-        
-        // CPU fallback complete - continue with gate and norm
-        // (skip GPU kernel cleanup since we didn't allocate those buffers)
-    } else {
+    // GPU kernels are required
+    if (!process_dt_kernel_ || !compute_dtA_kernel_ || !compute_segsum_decay_kernel_ || 
+        !compute_CB_kernel_ || !compute_ssm_output_kernel_) {
+        throw std::runtime_error("SSM forward GPU kernels not available - GPU kernels required");
+    }
+    
         // GPU path: Use SSM forward kernels
         // A is stored as already negative in MLX (not as A_log before negation)
         // So we use it directly without applying softplus or negation
@@ -1886,61 +1831,45 @@ cl_mem SSDLayer::forward(
         // Cleanup SSM output buffer
         clReleaseMemObject(x_ssm_output_buf);
         
-        // Cleanup GPU buffers (only if GPU path was used)
+    // Cleanup GPU buffers
         if (A_actual_buf) clReleaseMemObject(A_actual_buf);
         if (dt_processed_buf) clReleaseMemObject(dt_processed_buf);
         if (dtA_buf) clReleaseMemObject(dtA_buf);
         if (decay_buf) clReleaseMemObject(decay_buf);
         if (CB_buf) clReleaseMemObject(CB_buf);
         if (dtx_buf) clReleaseMemObject(dtx_buf);
-    }
     
-    // Step 6: Apply gate: Swish(z) * x using GPU kernel (or CPU fallback), then RMS norm
+    // Step 6: Apply gate: Swish(z) * x using GPU kernel, then RMS norm
     // Ensure kernels are built
     if (!program_) {
         buildKernels();
+    }
+    
+    // GPU kernel is required
+    if (!gate_kernel_) {
+        throw std::runtime_error("gate_kernel not available - GPU kernel required");
     }
     
     // Create output buffer for gated result (zero-initialized for determinism)
     cl_mem gated_buf = createAndZeroBuffer(context, queue, x_size * sizeof(float), &err);
     if (err != CL_SUCCESS || !gated_buf) throw std::runtime_error("Failed to create gated buffer");
     
-    // Try GPU kernel first, fall back to CPU if not available
-    bool gpu_success = false;
-    if (gate_kernel_) {
-        cl_int gpu_err = clSetKernelArg(gate_kernel_, 0, sizeof(cl_mem), &z_buf);
-        gpu_err |= clSetKernelArg(gate_kernel_, 1, sizeof(cl_mem), &x_buf);
-        gpu_err |= clSetKernelArg(gate_kernel_, 2, sizeof(cl_mem), &gated_buf);
-        gpu_err |= clSetKernelArg(gate_kernel_, 3, sizeof(int), &x_size);
-        
-        if (gpu_err == CL_SUCCESS) {
-            size_t gate_global_size = static_cast<size_t>(x_size);
-            gpu_err = clEnqueueNDRangeKernel(queue, gate_kernel_, 1, nullptr, &gate_global_size, nullptr, 0, nullptr, nullptr);
-            if (gpu_err == CL_SUCCESS) {
-                clFinish(queue);
-                gpu_success = true;
-            }
-        }
+    err = clSetKernelArg(gate_kernel_, 0, sizeof(cl_mem), &z_buf);
+    err |= clSetKernelArg(gate_kernel_, 1, sizeof(cl_mem), &x_buf);
+    err |= clSetKernelArg(gate_kernel_, 2, sizeof(cl_mem), &gated_buf);
+    err |= clSetKernelArg(gate_kernel_, 3, sizeof(int), &x_size);
+    
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to set gate kernel arguments");
     }
     
-    // CPU fallback if GPU kernel not available or failed
-    if (!gpu_success) {
-    std::vector<float> z_cpu(z_size);
-    std::vector<float> x_cpu_gated(x_size);
-    clEnqueueReadBuffer(queue, z_buf, CL_TRUE, 0, z_size * sizeof(float), z_cpu.data(), 0, nullptr, nullptr);
-    clEnqueueReadBuffer(queue, x_buf, CL_TRUE, 0, x_size * sizeof(float), x_cpu_gated.data(), 0, nullptr, nullptr);
-    
-    std::vector<float> gated_cpu(x_size);
-    for (int i = 0; i < x_size; ++i) {
-        float z_val = z_cpu[i];
-        float sigmoid_z = 1.0f / (1.0f + expf(-z_val));
-        float swish_z = z_val * sigmoid_z;
-        gated_cpu[i] = x_cpu_gated[i] * swish_z;
+    size_t gate_global_size = static_cast<size_t>(x_size);
+    err = clEnqueueNDRangeKernel(queue, gate_kernel_, 1, nullptr, &gate_global_size, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to enqueue gate kernel");
     }
     
-    clEnqueueWriteBuffer(queue, gated_buf, CL_TRUE, 0, x_size * sizeof(float), gated_cpu.data(), 0, nullptr, nullptr);
     clFinish(queue);
-    }
     
     // Apply RMS norm (norm_before_gate is False, so norm after gate)
     cl_mem normed = norm_layer_->forward(gated_buf, batch_size, seq_len, queue);
@@ -2108,78 +2037,41 @@ cl_mem SSDLayer::step(
     size_t x_size = batch_size * d_inner_;
     size_t BC_size = batch_size * d_state_ * n_groups_;
     
-    // Read xBC to CPU for splitting
-    std::vector<float> xBC_cpu(xBC_size);
-    clEnqueueReadBuffer(queue, xBC_buf, CL_TRUE, 0, xBC_size * sizeof(float), xBC_cpu.data(), 0, nullptr, nullptr);
-    
-    std::vector<float> x_cpu(x_size);
-    std::vector<float> B_cpu(BC_size);
-    std::vector<float> C_cpu(BC_size);
-    
-    for (int b = 0; b < batch_size; ++b) {
-        int xBC_base = b * (d_inner_ + 2 * d_state_ * n_groups_);
-        int x_base = b * d_inner_;
-        int BC_base = b * d_state_ * n_groups_;
-        
-        // Copy x
-        for (int i = 0; i < d_inner_; ++i) {
-            x_cpu[x_base + i] = xBC_cpu[xBC_base + i];
-        }
-        
-        // Copy B
-        for (int i = 0; i < d_state_ * n_groups_; ++i) {
-            B_cpu[BC_base + i] = xBC_cpu[xBC_base + d_inner_ + i];
-        }
-        
-        // Copy C
-        for (int i = 0; i < d_state_ * n_groups_; ++i) {
-            C_cpu[BC_base + i] = xBC_cpu[xBC_base + d_inner_ + d_state_ * n_groups_ + i];
-        }
+    // GPU kernel is required
+    if (!split_xBC_step_kernel_) {
+        throw std::runtime_error("split_xBC_step_kernel not available - GPU kernel required");
     }
     
+    // Create GPU buffers for x, B, C
+    cl_mem x_buf = createAndZeroBuffer(context, queue, x_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !x_buf) throw std::runtime_error("Failed to create x buffer");
+    
+    cl_mem B_buf = createAndZeroBuffer(context, queue, BC_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !B_buf) throw std::runtime_error("Failed to create B buffer");
+    
+    cl_mem C_buf = createAndZeroBuffer(context, queue, BC_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !C_buf) throw std::runtime_error("Failed to create C buffer");
+    
+    // Use GPU kernel to split xBC
+    int d_state_groups = d_state_ * n_groups_;
+    err = clSetKernelArg(split_xBC_step_kernel_, 0, sizeof(cl_mem), &xBC_buf);
+    err |= clSetKernelArg(split_xBC_step_kernel_, 1, sizeof(cl_mem), &x_buf);
+    err |= clSetKernelArg(split_xBC_step_kernel_, 2, sizeof(cl_mem), &B_buf);
+    err |= clSetKernelArg(split_xBC_step_kernel_, 3, sizeof(cl_mem), &C_buf);
+    err |= clSetKernelArg(split_xBC_step_kernel_, 4, sizeof(int), &batch_size);
+    err |= clSetKernelArg(split_xBC_step_kernel_, 5, sizeof(int), &d_inner_);
+    err |= clSetKernelArg(split_xBC_step_kernel_, 6, sizeof(int), &d_state_groups);
+    if (err != CL_SUCCESS) throw std::runtime_error("Failed to set split_xBC_step kernel args");
+    
+    size_t global_size_split = static_cast<size_t>(batch_size);
+    err = clEnqueueNDRangeKernel(queue, split_xBC_step_kernel_, 1, nullptr, &global_size_split, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) throw std::runtime_error("Failed to enqueue split_xBC_step kernel");
+    
+    clFinish(queue);
     clReleaseMemObject(xBC_buf);
     
-    // Step 5: SSM update (using ssm_state from state->state2)
-    // Read dt, A, D, dt_bias
-    std::vector<float> dt_cpu(dt_size);
-    std::vector<float> A_cpu(n_heads_);
-    std::vector<float> D_cpu(n_heads_);
-    std::vector<float> dt_bias_cpu(n_heads_);
-    
-    clEnqueueReadBuffer(queue, dt_buf, CL_TRUE, 0, dt_size * sizeof(float), dt_cpu.data(), 0, nullptr, nullptr);
-    clEnqueueReadBuffer(queue, A_, CL_TRUE, 0, n_heads_ * sizeof(float), A_cpu.data(), 0, nullptr, nullptr);
-    clEnqueueReadBuffer(queue, D_, CL_TRUE, 0, n_heads_ * sizeof(float), D_cpu.data(), 0, nullptr, nullptr);
-    clEnqueueReadBuffer(queue, dt_bias_, CL_TRUE, 0, n_heads_ * sizeof(float), dt_bias_cpu.data(), 0, nullptr, nullptr);
-    
-    // A is stored as already negative in MLX (not as A_log before negation)
-    // So we use it directly without applying softplus or negation
-    // MLX stores self.A as negative, and uses it directly in decay = exp(dt * A)
-    // No conversion needed - A is already the final value
-    // (Keeping the variable name A_cpu for consistency, but it's already the final A)
-    
-    // Process dt: add bias, apply softplus, clamp
-    for (int b = 0; b < batch_size; ++b) {
-        for (int h = 0; h < n_heads_; ++h) {
-            int dt_idx = b * n_heads_ + h;
-            float dt_val = dt_cpu[dt_idx] + dt_bias_cpu[h];
-            
-            // Apply softplus: log(1 + exp(dt))
-            if (dt_val > 20.0f) {
-                dt_val = dt_val;
-            } else {
-                dt_val = log1pf(expf(dt_val));
-            }
-            
-            // Clamp dt (dt_min=0.0, dt_max=inf)
-            if (dt_val < 0.0f) dt_val = 0.0f;
-            // dt_max is inf, so no upper clamp needed
-            
-            dt_cpu[dt_idx] = dt_val;
-        }
-    }
-    
+    // Step 5: SSM update (using ssm_state from state->state2) - GPU kernel
     // Get or initialize ssm_state
-    // ssm_state shape: [batch_size, n_heads, d_head, d_state]
     size_t ssm_state_size = batch_size * n_heads_ * d_head_ * d_state_;
     cl_mem ssm_state = state->state2;
     if (ssm_state == nullptr) {
@@ -2188,60 +2080,50 @@ cl_mem SSDLayer::step(
         if (err != CL_SUCCESS || !ssm_state) throw std::runtime_error("Failed to create ssm_state buffer");
     }
     
-    // Read ssm_state to CPU
-    std::vector<float> ssm_state_cpu(ssm_state_size);
-    clEnqueueReadBuffer(queue, ssm_state, CL_TRUE, 0, ssm_state_size * sizeof(float), ssm_state_cpu.data(), 0, nullptr, nullptr);
-    
-    // Perform SSM update for single token
-    // x is [batch_size, n_heads, d_head] after reshape
-    // For each batch, head, and head_dim, update state and compute output
-    std::vector<float> x_ssm_cpu(x_size);
-    
-    for (int b = 0; b < batch_size; ++b) {
-        for (int h = 0; h < n_heads_; ++h) {
-            float delta = dt_cpu[b * n_heads_ + h];
-            float A_val = A_cpu[h];
-            
-            for (int d = 0; d < d_head_; ++d) {
-                int x_idx = b * d_inner_ + h * d_head_ + d;
-                float x_val = x_cpu[x_idx];
-                
-                // Get group index for this head
-                int group_idx = h % n_groups_;
-                
-                float output_sum = 0.0f;
-                
-                // Update state and compute output for each state dimension
-                for (int state_i = 0; state_i < d_state_; ++state_i) {
-                    int state_idx = (b * n_heads_ + h) * d_head_ * d_state_ + d * d_state_ + state_i;
-                    float old_state = ssm_state_cpu[state_idx];
-                    
-                    // Get B and C values
-                    int B_idx = b * (d_state_ * n_groups_) + group_idx * d_state_ + state_i;
-                    float B_val = B_cpu[B_idx];
-                    int C_idx = B_idx;  // Same indexing
-                    float C_val = C_cpu[C_idx];
-                    
-                    // State update: new_state = old_state * exp(A * delta) + B * delta * x
-                    float new_state = old_state * expf(A_val * delta) + B_val * delta * x_val;
-                    ssm_state_cpu[state_idx] = new_state;
-                    
-                    // Output contribution: new_state * C
-                    output_sum += new_state * C_val;
-                }
-                
-                // Add D skip connection: D * x
-                output_sum += D_cpu[h] * x_val;
-                
-                x_ssm_cpu[x_idx] = output_sum;
-            }
-        }
+    // GPU kernel is required
+    if (!ssm_step_update_kernel_) {
+        throw std::runtime_error("ssm_step_update_kernel not available - GPU kernel required");
     }
     
-    // Write updated ssm_state back (zero-initialized for determinism)
+    if (x_buf == nullptr || B_buf == nullptr || C_buf == nullptr) {
+        throw std::runtime_error("x_buf, B_buf, or C_buf is null - GPU buffers required");
+    }
+    
+    // x, B, C are already on GPU from split kernel
+    // Create output buffer for SSM result
+    cl_mem ssm_output = createAndZeroBuffer(context, queue, x_size * sizeof(float), &err);
+    if (err != CL_SUCCESS || !ssm_output) throw std::runtime_error("Failed to create SSM output buffer");
+    
+    // Create next_state buffer
     cl_mem next_ssm_state = createAndZeroBuffer(context, queue, ssm_state_size * sizeof(float), &err);
     if (err != CL_SUCCESS || !next_ssm_state) throw std::runtime_error("Failed to create next_ssm_state buffer");
-    clEnqueueWriteBuffer(queue, next_ssm_state, CL_TRUE, 0, ssm_state_size * sizeof(float), ssm_state_cpu.data(), 0, nullptr, nullptr);
+    
+    // Set kernel arguments
+    err = clSetKernelArg(ssm_step_update_kernel_, 0, sizeof(cl_mem), &x_buf);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 1, sizeof(cl_mem), &dt_buf);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 2, sizeof(cl_mem), &dt_bias_);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 3, sizeof(cl_mem), &A_);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 4, sizeof(cl_mem), &B_buf);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 5, sizeof(cl_mem), &C_buf);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 6, sizeof(cl_mem), &D_);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 7, sizeof(cl_mem), &ssm_state);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 8, sizeof(cl_mem), &ssm_output);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 9, sizeof(cl_mem), &next_ssm_state);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 10, sizeof(int), &batch_size);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 11, sizeof(int), &n_heads_);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 12, sizeof(int), &d_head_);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 13, sizeof(int), &d_state_);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 14, sizeof(int), &n_groups_);
+    err |= clSetKernelArg(ssm_step_update_kernel_, 15, sizeof(int), &d_inner_);
+    
+    if (err != CL_SUCCESS) throw std::runtime_error("Failed to set ssm_step_update kernel args");
+    
+    // Execute kernel: 1D work group (batch_size * n_heads * d_head)
+    size_t global_size = static_cast<size_t>(batch_size * n_heads_ * d_head_);
+    err = clEnqueueNDRangeKernel(queue, ssm_step_update_kernel_, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) throw std::runtime_error("Failed to enqueue ssm_step_update kernel");
+    
+    clFinish(queue);
     
     // Update state->state2
     if (state->state2 != ssm_state) {
@@ -2250,58 +2132,45 @@ cl_mem SSDLayer::step(
     state->state2 = next_ssm_state;
     if (ssm_state != state->state2) clReleaseMemObject(ssm_state);
     
-    // Write x_ssm to GPU (zero-initialized for determinism)
-    cl_mem x_buf = createAndZeroBuffer(context, queue, x_size * sizeof(float), &err);
-    if (err != CL_SUCCESS || !x_buf) throw std::runtime_error("Failed to create x buffer");
-    clEnqueueWriteBuffer(queue, x_buf, CL_TRUE, 0, x_size * sizeof(float), x_ssm_cpu.data(), 0, nullptr, nullptr);
-    clFinish(queue);
+    // Release old x_buf and use SSM output
+    clReleaseMemObject(x_buf);
+    x_buf = ssm_output;
     
-    // Step 6: Apply gate: Swish(z) * x using GPU kernel (or CPU fallback), then RMS norm
+    // Release B and C buffers (no longer needed)
+    clReleaseMemObject(B_buf);
+    clReleaseMemObject(C_buf);
+    
+    // Step 6: Apply gate: Swish(z) * x using GPU kernel, then RMS norm
     // Ensure kernels are built
     if (!program_) {
         buildKernels();
+    }
+    
+    // GPU kernel is required
+    if (!gate_kernel_) {
+        throw std::runtime_error("gate_kernel not available - GPU kernel required");
     }
     
     // Create output buffer for gated result (zero-initialized for determinism)
     cl_mem gated_buf = createAndZeroBuffer(context, queue, x_size * sizeof(float), &err);
     if (err != CL_SUCCESS || !gated_buf) throw std::runtime_error("Failed to create gated buffer");
     
-    // Try GPU kernel first, fall back to CPU if not available
-    bool gpu_success = false;
-    if (gate_kernel_) {
-        cl_int gpu_err = clSetKernelArg(gate_kernel_, 0, sizeof(cl_mem), &z_buf);
-        gpu_err |= clSetKernelArg(gate_kernel_, 1, sizeof(cl_mem), &x_buf);
-        gpu_err |= clSetKernelArg(gate_kernel_, 2, sizeof(cl_mem), &gated_buf);
-        gpu_err |= clSetKernelArg(gate_kernel_, 3, sizeof(int), &x_size);
-        
-        if (gpu_err == CL_SUCCESS) {
-            size_t gate_global_size = static_cast<size_t>(x_size);
-            gpu_err = clEnqueueNDRangeKernel(queue, gate_kernel_, 1, nullptr, &gate_global_size, nullptr, 0, nullptr, nullptr);
-            if (gpu_err == CL_SUCCESS) {
-                clFinish(queue);
-                gpu_success = true;
-            }
-        }
+    err = clSetKernelArg(gate_kernel_, 0, sizeof(cl_mem), &z_buf);
+    err |= clSetKernelArg(gate_kernel_, 1, sizeof(cl_mem), &x_buf);
+    err |= clSetKernelArg(gate_kernel_, 2, sizeof(cl_mem), &gated_buf);
+    err |= clSetKernelArg(gate_kernel_, 3, sizeof(int), &x_size);
+    
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to set gate kernel arguments");
     }
     
-    // CPU fallback if GPU kernel not available or failed
-    if (!gpu_success) {
-    std::vector<float> z_cpu(z_size);
-        std::vector<float> x_cpu_gated(x_size);
-    clEnqueueReadBuffer(queue, z_buf, CL_TRUE, 0, z_size * sizeof(float), z_cpu.data(), 0, nullptr, nullptr);
-        clEnqueueReadBuffer(queue, x_buf, CL_TRUE, 0, x_size * sizeof(float), x_cpu_gated.data(), 0, nullptr, nullptr);
-    
-    std::vector<float> gated_cpu(x_size);
-    for (int i = 0; i < x_size; ++i) {
-        float z_val = z_cpu[i];
-        float sigmoid_z = 1.0f / (1.0f + expf(-z_val));
-        float swish_z = z_val * sigmoid_z;
-            gated_cpu[i] = x_cpu_gated[i] * swish_z;
+    size_t gate_global_size = static_cast<size_t>(x_size);
+    err = clEnqueueNDRangeKernel(queue, gate_kernel_, 1, nullptr, &gate_global_size, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        throw std::runtime_error("Failed to enqueue gate kernel");
     }
     
-    clEnqueueWriteBuffer(queue, gated_buf, CL_TRUE, 0, x_size * sizeof(float), gated_cpu.data(), 0, nullptr, nullptr);
     clFinish(queue);
-    }
     
     // Apply RMS norm (norm_before_gate is False, so norm after gate)
     cl_mem normed = norm_layer_->forward(gated_buf, batch_size, 1, queue);

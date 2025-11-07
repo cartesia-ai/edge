@@ -44,9 +44,16 @@ private:
     int num_chunks_;                        // Number of chunks
     bool weights_initialized_;
     
+    // GPU kernel for embedding lookup
+    cl_program program_;
+    cl_kernel embedding_kernel_;
+    
     // Temporary output buffers
     cl_mem output_buffer_;
     size_t output_buffer_size_;
+    
+    // Build OpenCL kernels
+    void buildKernels();
 };
 
 } // namespace cartesia_opencl

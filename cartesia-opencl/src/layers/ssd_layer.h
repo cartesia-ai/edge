@@ -108,6 +108,8 @@ private:
     
     // Helper kernels
     cl_kernel split_in_proj_kernel_;
+    cl_kernel split_xBC_step_kernel_;  // NEW: for step() function
+    cl_kernel ssm_step_update_kernel_;  // NEW: for step() SSM update
     cl_kernel gate_kernel_;
     cl_kernel copy_channels_kernel_;
     
