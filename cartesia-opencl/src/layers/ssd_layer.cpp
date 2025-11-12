@@ -2119,8 +2119,8 @@ cl_mem SSDLayer::step(
     if (err != CL_SUCCESS) throw std::runtime_error("Failed to set ssm_step_update kernel args");
     
     // Execute kernel: 1D work group (batch_size * n_heads * d_head)
-    size_t global_size = static_cast<size_t>(batch_size * n_heads_ * d_head_);
-    err = clEnqueueNDRangeKernel(queue, ssm_step_update_kernel_, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    size_t global_size_ssm = static_cast<size_t>(batch_size * n_heads_ * d_head_);
+    err = clEnqueueNDRangeKernel(queue, ssm_step_update_kernel_, 1, nullptr, &global_size_ssm, nullptr, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) throw std::runtime_error("Failed to enqueue ssm_step_update kernel");
     
     clFinish(queue);

@@ -156,7 +156,7 @@ cmake \
     -DANDROID_ABI=arm64-v8a \
     -DANDROID_PLATFORM=android-${ANDROID_API} \
     -DCMAKE_BUILD_TYPE=Release \
-    -DANDROID_STL=c++_shared \
+    -DANDROID_STL=c++_static \
     ${CMAKE_PREFIX_PATH:+-DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}"} \
     -S .
 

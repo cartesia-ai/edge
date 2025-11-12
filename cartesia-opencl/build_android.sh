@@ -215,7 +215,7 @@ fi
 ANDROID_API="${ANDROID_API:-21}"
 ANDROID_ABI="${ANDROID_ABI:-arm64-v8a}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
-ANDROID_STL="${ANDROID_STL:-c++_shared}"
+ANDROID_STL="${ANDROID_STL:-c++_static}"
 
 echo "Building with:"
 echo "  NDK: $NDK_PATH"

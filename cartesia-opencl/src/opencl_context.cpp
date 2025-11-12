@@ -143,7 +143,7 @@ cl_program OpenCLContextManager::buildProgram(const std::vector<std::string>& so
     // - cl-finite-math-only: disabled (omitted) to handle NaN/Inf consistently
     const char* env_opts = std::getenv("OPENCL_BUILD_OPTS");
     std::string build_opts = env_opts ? std::string(env_opts) : 
-        std::string("-cl-std=CL1.2 -cl-opt-disable -cl-fp32-correctly-rounded-divide-sqrt");
+        std::string("-cl-std=CL1.2 -cl-opt-disable");
     err = clBuildProgram(program, 1, &device_, build_opts.c_str(), nullptr, nullptr);
     if (err != CL_SUCCESS) {
         std::string build_log = getBuildLog(program);
